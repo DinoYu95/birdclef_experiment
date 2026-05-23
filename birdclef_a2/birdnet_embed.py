@@ -18,8 +18,8 @@ def birdnet_sample_rate() -> int:
         import birdnet
     except ImportError as e:  # pragma: no cover
         raise ImportError(
-            "BirdNET embedding backend requires: pip install birdnet-analyzer "
-            "(pulls tensorflow and the birdnet package)"
+            "Missing the `birdnet` package (distinct from birdnet-analyzer). "
+            "Install: pip install birdnet-analyzer birdnet"
         ) from e
 
     model = birdnet.load("acoustic", "2.4", "tf")

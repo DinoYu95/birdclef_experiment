@@ -14,9 +14,10 @@ tqdm>=4.66,<5
 librosa>=0.11,<0.13
 soundfile>=0.12,<0.15
 
-# BirdNET embeddings: let birdnet-analyzer pull compatible tensorflow/birdnet.
-# Avoid pinning tensorflow here — it clashes with Analyzer's transitive pins on some resolves.
+# BirdNET embeddings: birdnet_analyzer exposes get_embeddings_array; sample rate/model load uses the separate `birdnet` library (birdnet-team).
+# tensorflow is pulled transitively by birdnet + birdnet-analyzer (prefer >=2.20 for Analyzer 2.4.x).
 birdnet-analyzer>=2.4,<4
+birdnet>=0.2.5,<1
 
 # Scratch mel-CNN training
 torch>=2.2,<3
