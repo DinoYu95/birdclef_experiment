@@ -1,0 +1,241 @@
+"""
+Synthetic audio augmentation using AudioLDM2 (diffusers).
+
+Course briefs sometimes refer to this family as \"AudioLM2\"; here we use the public
+AudioLDM2 checkpoints from Hugging Face `cvssp/audioldm2*`.
+"""
+from __future__ import annotations
+
+import logging
+import uuid
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from birdclef_a2.birdnet_verify_synth import synthetic_passes_birdnet_classifier
+
+logger = logging.getLogger(__name__)
+
+
+def prompt_for_taxon(
+    primary_label: str,
+    *,
+    primary_to_common: dict[str, str],
+    primary_to_sci: dict[str, str],
+) -> str:
+    cn = primary_to_common.get(primary_label, "wildlife sound")
+    sn = primary_to_sci.get(primary_label, "")
+    bits = [
+        "high quality mono field recording",
+        f"animal vocalization of {cn}",
+    ]
+    if sn:
+        bits.append(sn)
+    bits.append("natural ambient noise, no music")
+    return ", ".join(bits)
+
+
+def load_taxonomy_maps(
+    taxonomy_csv: Path,
+) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    df = pd.read_csv(taxonomy_csv)
+    pl = df["primary_label"].astype(str)
+    common = dict(zip(pl.tolist(), df["common_name"].astype(str).tolist()))
+    sci = dict(zip(pl.tolist(), df["scientific_name"].astype(str).tolist()))
+    cls_col = "class_name" if "class_name" in df.columns else None
+    cls_map: dict[str, str] = (
+        dict(zip(pl.tolist(), df["class_name"].astype(str).tolist())) if cls_col else {}
+    )
+    return common, sci, cls_map
+
+
+def compute_training_deficits(
+    *,
+    train_manifest: Path,
+    val_manifest: Path | None,
+    label_col: str,
+    target_per_class: int,
+) -> dict[str, int]:
+    tr = pd.read_csv(train_manifest)
+    vc = tr[label_col].astype(str).value_counts()
+    labs = set(vc.index.astype(str))
+    if val_manifest is not None:
+        va = pd.read_csv(val_manifest)
+        labs |= set(va[label_col].astype(str))
+    deficits: dict[str, int] = {}
+    for lab in sorted(labs):
+        cnt = int(vc.get(lab, 0))
+        need = int(target_per_class) - cnt
+        if need > 0:
+            deficits[lab] = need
+    return deficits
+
+
+def _taxon_is_bird(class_name: str) -> bool:
+    return class_name.strip().lower() == "aves"
+
+
+def generate_balanced_synthetic_manifest(
+    *,
+    data_root: Path,
+    train_manifest: Path,
+    val_manifest: Path | None,
+    taxonomy_csv: Path,
+    out_manifest: Path,
+    out_audio_dir: Path,
+    label_col: str,
+    hf_model_id: str,
+    target_per_class: int | None,
+    max_target_cap: int | None,
+    audio_seconds: float,
+    inference_steps: int,
+    seed: int,
+    verify_birdnet: bool,
+    verify_top_k: int,
+    verify_run_min_confidence: float,
+    verify_row_min_confidence: float,
+    verify_max_retries: int,
+    verify_only_bird_classes: bool,
+    dtype: str,
+    limit_classes: int | None,
+    dry_run: bool,
+) -> None:
+    primary_to_common, primary_to_sci, primary_to_class = load_taxonomy_maps(taxonomy_csv)
+    df_tr = pd.read_csv(train_manifest)
+    vc = df_tr[label_col].astype(str).value_counts()
+    max_cnt = int(vc.max())
+
+    tgt = max_cnt if target_per_class is None else int(target_per_class)
+    if max_target_cap is not None:
+        tgt = min(tgt, int(max_target_cap))
+
+    deficits = compute_training_deficits(
+        train_manifest=train_manifest,
+        val_manifest=val_manifest,
+        label_col=label_col,
+        target_per_class=tgt,
+    )
+    items = sorted(deficits.items(), key=lambda x: x[0])
+    if limit_classes is not None:
+        items = items[: int(limit_classes)]
+
+    out_audio_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, str]] = []
+
+    total_new = sum(n for _, n in items)
+
+    if dry_run:
+        print(f"Would synthesize ~ {total_new} clips across {len(items)} labels.")
+        return
+
+    try:
+        import torch
+        from diffusers import AudioLDM2Pipeline
+    except ImportError as e:  # pragma: no cover
+        raise ImportError(
+            "Synthetic generation requires: pip install diffusers transformers accelerate torch soundfile"
+        ) from e
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    torch_dtype = torch.float16 if dtype == "fp16" else torch.float32
+    pipe = AudioLDM2Pipeline.from_pretrained(hf_model_id, torch_dtype=torch_dtype)
+
+    if torch.cuda.is_available():
+        pipe = pipe.to("cuda")
+        try:
+            pipe.enable_attention_slicing()
+        except Exception:  # pragma: no cover
+            pass
+    else:
+        pipe.enable_model_cpu_offload()
+
+    try:
+        sr = int(pipe.vocoder.config.sampling_rate)
+    except Exception:
+        sr = 16000
+
+    import soundfile as sf
+
+    done = 0
+    n_rejected = 0
+    for lab, need in items:
+        subdir = out_audio_dir / lab
+        subdir.mkdir(parents=True, exist_ok=True)
+        prompt = prompt_for_taxon(
+            lab, primary_to_common=primary_to_common, primary_to_sci=primary_to_sci
+        )
+
+        sci_n = primary_to_sci.get(lab, "")
+        com_n = primary_to_common.get(lab, "")
+        cls_name = primary_to_class.get(lab, "")
+        run_birdnet_verify = bool(verify_birdnet) and (
+            not verify_only_bird_classes or _taxon_is_bird(cls_name)
+        )
+        if verify_birdnet and verify_only_bird_classes and not _taxon_is_bird(cls_name):
+            logger.info(
+                "BirdNET verify skipped for non-Aves taxon %s (class_name=%r)",
+                lab,
+                cls_name,
+            )
+
+        produced = 0
+        attempt_budget = need * verify_max_retries if run_birdnet_verify else need
+        attempts = 0
+
+        while produced < need and attempts < attempt_budget:
+            attempts += 1
+            fname = f"{uuid.uuid4().hex}.wav"
+            out_wav = subdir / fname
+
+            out = pipe(
+                prompt,
+                audio_length_in_s=float(audio_seconds),
+                num_inference_steps=int(inference_steps),
+            )
+            audio = np.asarray(out.audios[0], dtype=np.float32)
+
+            sf.write(out_wav, audio, sr)
+
+            if run_birdnet_verify:
+                ok = synthetic_passes_birdnet_classifier(
+                    out_wav,
+                    scientific_name=sci_n,
+                    common_name=com_n,
+                    top_k=verify_top_k,
+                    run_min_confidence=verify_run_min_confidence,
+                    row_min_confidence=verify_row_min_confidence,
+                )
+                if not ok:
+                    n_rejected += 1
+                    try:
+                        out_wav.unlink()
+                    except OSError:
+                        pass
+                    continue
+
+            rel_path = Path(out_wav).resolve().relative_to(Path(data_root).resolve())
+            rows.append({"filename": rel_path.as_posix(), label_col: lab})
+            produced += 1
+            done += 1
+            if done % 10 == 0:
+                logger.info("synthetic accepted %s / ~%s total", done, total_new)
+
+        if produced < need:
+            logger.warning(
+                "label %s: only %s/%s accepted after %s attempts (verify=%s)",
+                lab,
+                produced,
+                need,
+                attempts,
+                verify_birdnet,
+            )
+
+    out_manifest.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(out_manifest, index=False)
+    print(
+        f"Wrote {len(rows)} synthetic rows to {out_manifest} "
+        f"(birdnet_rejected_segments={n_rejected})"
+    )

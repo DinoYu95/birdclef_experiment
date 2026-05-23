@@ -1,0 +1,135 @@
+================================================================================
+1) WHAT TO READ FIRST (code tour)
+================================================================================
+
+Order:
+  birdclef_a2/config.py          -> DATA root, train.csv + train_audio/ layout
+  birdclef_a2/split.py           -> stratified split + singleton-only -> val rule
+  birdclef_a2/cli_split.py      -> ENTRY: builds train.manifest.csv + val.manifest.csv
+
+  birdclef_a2/manifest_utils.py -> how filename joins to disk path
+  birdclef_a2/audio_io.py       -> librosa load + segment windows for BirdNET
+
+  birdclef_a2/birdnet_embed.py  -> BirdNET TF embeddings -> NPZ
+  birdclef_a2/cli_embed.py      -> ENTRY: manifest -> embeddings .npz
+
+  birdclef_a2/sklearn_head.py   -> StandardScaler + LogReg / HistGB
+  birdclef_a2/cli_sklearn_train.py -> ENTRY: train/val NPZ -> model.joblib + reports
+
+  birdclef_a2/torch_scratch.py  -> mel CNN baseline (manifest -> torch)
+  birdclef_a2/cli_torch_train.py
+
+  birdclef_a2/synth_audioldm2.py      -> AudioLDM2 synth + balancing
+  birdclef_a2/birdnet_verify_synth.py -> optional BirdNET classify filter (--verify-birdnet)
+  birdclef_a2/cli_synth_balanced.py
+  birdclef_a2/cli_merge_manifests.py  -> concat CSV manifests
+
+requirements.txt               -> pinned-ish deps (TF + torch + diffusers heavy)
+
+Typical pipelines:
+  Part A baseline: cli_split -> cli_embed(train) -> cli_embed(val) -> cli_sklearn_train
+                   OR cli_split -> cli_torch_train
+  Part B:          cli_merge after cli_synth_balanced (+ embed with --audio-relative-to data_root)
+
+================================================================================
+2) RUN ON LOCAL OR REMOTE LINUX (same commands)
+================================================================================
+
+From this directory:
+
+  cd birdclef_assignment2
+  python3 -m venv .venv
+  source .venv/bin/activate
+  pip install -U pip wheel
+  pip install -r requirements.txt
+
+Pick one root folder that contains BOTH:
+  train.csv
+  train_audio/
+
+Export once per shell session:
+
+  export BIRDCLEF_DATA_ROOT="/path/to/competition/root"
+
+Examples:
+
+  python -m birdclef_a2.cli_split \
+    --out-dir outputs/splits
+
+  python -m birdclef_a2.cli_embed \
+    --manifest outputs/splits/train.manifest.csv \
+    --out-npz outputs/emb/train.npz
+
+  python -m birdclef_a2.cli_embed \
+    --manifest outputs/splits/val.manifest.csv \
+    --out-npz outputs/emb/val.npz
+
+  python -m birdclef_a2.cli_sklearn_train \
+    --train-npz outputs/emb/train.npz \
+    --val-npz outputs/emb/val.npz \
+    --out-dir outputs/sklearn_head
+
+Synth (heavy). After merge, embeddings need paths relative to data root:
+
+  python -m birdclef_a2.cli_synth_balanced \
+    --train-manifest outputs/splits/train.manifest.csv \
+    --val-manifest outputs/splits/val.manifest.csv
+
+  python -m birdclef_a2.cli_merge_manifests \
+    --inputs outputs/splits/train.manifest.csv outputs/synthetic/synthetic.manifest.csv \
+    --out-csv outputs/splits/train_plus_synth.manifest.csv
+
+  python -m birdclef_a2.cli_embed \
+    --manifest outputs/splits/train_plus_synth.manifest.csv \
+    --out-npz outputs/emb/train_synth.npz \
+    --audio-relative-to data_root
+
+================================================================================
+3) VAST.AI PRACTICAL SETUP (short)
+================================================================================
+
+Goal: rented GPU Ubuntu box -> install deps -> put data -> run CLI in tmux.
+
+A) Rent an instance:
+  - Template: Prefere "Ubuntu + CUDA driver" or a PyTorch CUDA image IF you patch TF later.
+  - Disk: BirdCLEF train ~16 GB + models cache -> pick enough volume (>= 80 GB safe).
+  - GPU RAM: synth + BirdNET wants headroom -> 24 GB+ nicer than 12 GB.
+
+B) SSH in (use the command vast.ai gives you).
+
+C) Dependencies on Linux:
+  - Install Python 3.10 or 3.11 (venv recommended).
+  - pip install -r requirements.txt inside venv.
+
+  Known pain: tensorflow + CUDA must match NVIDIA driver/CUDA variant on host.
+    If TF GPU breaks, embeddings can still fall back to CPU (slow).
+
+D) Bring your repo:
+  git clone ...   OR   scp/rsync your birdclef_assignment2 folder into ~/work/
+
+E) Competition data:
+  Option 1 Kaggle CLI:
+    pip install kaggle
+    mkdir -p ~/.kaggle && chmod 700 ~/.kaggle
+    Place kaggle.json (API token).
+    kaggle competitions download -c birdclef-2026 -p ~/data/
+    unzip in ~/data/birdclef-2026/ so train.csv sits next to train_audio/
+
+  Option 2 wget/rsync from your home PC already-unzipped copy.
+
+  export BIRDCLEF_DATA_ROOT=~/data/birdclef-2026
+
+F) Hugging Face (AudioLDM2 checkpoints):
+    pip install huggingface_hub
+    huggingface-cli login
+  First run will cache under ~/.cache/huggingface
+
+G) Long jobs:
+    apt install tmux   # if missing
+    tmux new -s train
+    # run pipelines; Ctrl-B D to detach; tmux attach -t train later
+
+H) Ship results back:
+  scp user@instance:~/work/birdclef_assignment2/outputs ./local_outputs/
+
+Do NOT leak kaggle.json or HF tokens -> keep out of git, chmod 600.
