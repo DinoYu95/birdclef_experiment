@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 
 from birdclef_a2.config import load_layout
+from birdclef_a2.report_exports import write_json
 from birdclef_a2.synth_audioldm2 import generate_balanced_synthetic_manifest
 
 
@@ -114,6 +115,14 @@ def main() -> None:
         dtype=args.dtype,
         limit_classes=args.limit_classes,
         dry_run=args.dry_run,
+    )
+    synth_cfg_path = Path(args.out_manifest).parent / "synthetic_experiment_config.json"
+    write_json(
+        synth_cfg_path,
+        {
+            "cli": "cli_synth_balanced",
+            **{k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+        },
     )
 
 

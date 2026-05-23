@@ -1,0 +1,83 @@
+================================================================================
+REPORT OUTPUTS (what to paste / plot)
+================================================================================
+After each run you should save the whole output folder. Key files:
+
+cli_split  -> split_summary.json (+ train/val manifests)
+              Now includes "cli_args" for reproducibility.
+
+cli_embed  -> *.embed_config.json next to each .npz (segment length, overlap, etc.)
+
+cli_sklearn_train -> val_metrics.json
+                     val_classification_report.txt
+                     val_predictions.csv       (y_true, y_pred, filename)
+                     val_confusion_matrix.csv
+                     experiment_config.json
+
+cli_torch_train  -> same four val_* plus experiment_config.json
+                    (Torch also sets best_epoch_val_accuracy inside val_metrics.json)
+
+cli_synth_balanced -> synthetic_experiment_config.json (under synthetic manifest folder)
+
+Aggregate for LaTeX/Word tables:
+  python -m birdclef_a2.cli_summarize_runs \
+    --rows A_logreg=outputs/A_sklearn_head B_hgb=outputs/A_hgb C_torch=outputs/A_torch \
+    --out-csv outputs/metrics_comparison.csv
+
+Suggested headline metrics for the report:
+  - macro_f1 (primary, class imbalance)
+  - weighted_f1
+  - balanced_accuracy
+  - accuracy (secondary; explain bias toward majority classes)
+  - cohen_kappa (overall agreement; NaN if degenerate)
+
+================================================================================
+HYPERPARAMETERS BY METHOD (what you can tune + how)
+================================================================================
+
+1) DATA SPLIT  (python -m birdclef_a2.cli_split)
+   Tunable:
+     --val-fraction        default 0.2  (try 0.15-0.25 if you discuss stability)
+     --seed                reproducibility; try 2-3 seeds for variance paragraph
+     --group-col           optional anti-leakage grouping (if you define a column)
+     --label-col           if CSV differs
+   Tuning idea: fix one seed for main table; appendix = seed sweep min/max.
+
+2) BIRDNET EMBEDDINGS  (python -m birdclef_a2.cli_embed)
+   Tunable:
+     --segment-s           window length (e.g. 2.0 / 3.0 / 5.0 s)
+     --overlap-s           more overlap => more segments => smoother mean pooling
+     --embed-batch-segments VRAM/CPU time tradeoff
+     --limit-rows          debug only; remove for final numbers
+   Tuning idea: small grid (2 segment_s x 2 overlap) -> report best val macro_f1.
+
+3) SKLEARN ON EMBEDDINGS  (python -m birdclef_a2.cli_sklearn_train)
+   Tunable:
+     --model               logreg | hgb  (strong baseline compare)
+     --logreg-c            inverse reg strength (e.g. 0.25, 1, 4)
+     --logreg-max-iter     if convergence warnings
+     --hgb-max-depth       4-12 typical
+     --hgb-learning-rate   0.01-0.1
+     --hgb-max-iter        more trees
+     --seed
+   Tuning idea: manual coarse grid or RandomizedSearchCV (if you extend code).
+   For report: state chosen values + one ablation table (e.g. C vs macro_f1).
+
+4) SCRATCH MEL-CNN  (python -m birdclef_a2.cli_torch_train)
+   Tunable (CLI):
+     --epochs             10-40
+     --batch-size         lower if OOM
+     --lr                 1e-4 .. 1e-3 common
+     --seed
+   Code-level (if you edit torch_scratch.ManifestMelDataset):
+     segment_s (default 5s), mel n_mels / hop / sample_rate
+
+5) SYNTHESIS  (python -m birdclef_a2.cli_synth_balanced)
+   Tunable:
+     --target-per-class / --max-target-cap   how aggressive balancing is
+     --audio-seconds       length of each clip (VRAM/time)
+     --inference-steps     quality vs speed
+     --hf-model-id         checkpoint choice
+     --verify-birdnet + verify-* thresholds   quality filter strength
+     --dtype               fp16 vs fp32
+     --seed

@@ -12,6 +12,13 @@ from torch.utils.data import DataLoader, Dataset
 
 from birdclef_a2.audio_io import load_audio_mono
 from birdclef_a2.manifest_utils import assert_manifest_columns, resolve_audio_path
+from birdclef_a2.report_exports import (
+    classification_report_txt,
+    save_confusion_matrix_csv,
+    save_val_predictions_csv,
+    scalar_metrics,
+    write_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -232,19 +239,22 @@ def train_torch_classifier(
 
     print(f"Best val acc ~ {best_acc:.4f}; checkpoint: {best_path}")
 
-    import json
-
-    from sklearn.metrics import classification_report, f1_score
-
     try:
         ckpt = torch.load(best_path, map_location=device, weights_only=False)
     except TypeError:
         ckpt = torch.load(best_path, map_location=device)
     model.load_state_dict(ckpt["model"])
+    idx_cursor = 0
+    fnames_collect: list[str] = []
     ys: list[int] = []
     ps: list[int] = []
     with torch.no_grad():
         for xb, yb in dl_va:
+            b = int(yb.shape[0])
+            fnames_collect.extend(
+                ds_va.df.iloc[idx_cursor : idx_cursor + b]["filename"].astype(str).tolist()
+            )
+            idx_cursor += b
             xb = xb.to(device)
             logits = model(xb)
             pred = logits.argmax(dim=-1).cpu().numpy().tolist()
@@ -252,11 +262,21 @@ def train_torch_classifier(
             ys.extend(yb.numpy().tolist())
     y_names = [classes[i] for i in ys]
     p_names = [classes[i] for i in ps]
-    report = classification_report(y_names, p_names, zero_division=0)
-    macro_f1 = float(f1_score(y_names, p_names, average="macro", zero_division=0))
+    report = classification_report_txt(y_names, p_names)
+    metrics = scalar_metrics(y_names, p_names)
+    metrics["best_epoch_val_accuracy"] = float(best_acc)
+
     (out_dir / "val_classification_report.txt").write_text(report, encoding="utf-8")
-    (out_dir / "val_metrics.json").write_text(
-        json.dumps({"macro_f1": macro_f1, "accuracy": float(best_acc)}, indent=2),
-        encoding="utf-8",
+    write_json(out_dir / "val_metrics.json", metrics)
+    save_val_predictions_csv(
+        out_dir / "val_predictions.csv",
+        y_true=y_names,
+        y_pred=p_names,
+        filenames=fnames_collect,
+    )
+    save_confusion_matrix_csv(
+        out_dir / "val_confusion_matrix.csv",
+        y_true=y_names,
+        y_pred=p_names,
     )
     print(f"Wrote val report to {out_dir / 'val_classification_report.txt'}")

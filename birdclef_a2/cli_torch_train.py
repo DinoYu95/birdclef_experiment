@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 
 from birdclef_a2.config import load_layout
+from birdclef_a2.report_exports import write_json
 from birdclef_a2.torch_scratch import train_torch_classifier
 
 
@@ -42,6 +43,17 @@ def main() -> None:
         lr=args.lr,
         seed=args.seed,
         num_workers=args.num_workers,
+    )
+    write_json(
+        args.out_dir / "experiment_config.json",
+        {
+            "cli": "cli_torch_train",
+            "data_root": str(layout.root),
+            **{
+                k: str(v) if isinstance(v, Path) else v
+                for k, v in vars(args).items()
+            },
+        },
     )
 
 

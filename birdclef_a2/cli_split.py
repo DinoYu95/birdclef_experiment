@@ -75,6 +75,9 @@ def main() -> None:
         "n_singleton_rows": spl.n_singleton_rows,
         "n_classes_total": int(df[args.label_col].nunique()),
         "seed": args.seed,
+        "cli_args": {
+            k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
+        },
     }
     (args.out_dir / "split_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"

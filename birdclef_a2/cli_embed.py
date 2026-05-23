@@ -7,6 +7,7 @@ from pathlib import Path
 
 from birdclef_a2.birdnet_embed import manifest_to_embeddings_npz
 from birdclef_a2.config import load_layout
+from birdclef_a2.report_exports import write_json
 
 
 def main() -> None:
@@ -40,6 +41,14 @@ def main() -> None:
         embed_batch_segments=args.embed_batch_segments,
         limit_rows=args.limit_rows,
         audio_relative_to=args.audio_relative_to,
+    )
+    write_json(
+        args.out_npz.with_name(args.out_npz.stem + ".embed_config.json"),
+        {
+            "cli": "cli_embed",
+            "data_root": str(layout.root),
+            **{k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+        },
     )
     print(f"Wrote {args.out_npz}")
 
