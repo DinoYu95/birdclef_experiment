@@ -1,5 +1,5 @@
-# Embedding path: birdnet-analyzer 2.4.x needs Python>=3.11, librosa>=0.11, tensorflow>=2.20 (PyPI).
-# Do not cap tensorflow below 2.20 if you pin birdnet-analyzer>=2.4.
+# Embedding path: use PyPI `birdnet` (Cornell) for TF 2.4 acoustic model; needs Python>=3.11 and compatible TensorFlow wheels.
+# Do not pin an old tensorflow ceiling here — `birdnet` declares its own lower bound.
 
 # Core tables + split + sklearn head
 pandas>=2.0,<3
@@ -14,9 +14,8 @@ tqdm>=4.66,<5
 librosa>=0.11,<0.13
 soundfile>=0.12,<0.15
 
-# BirdNET embeddings: birdnet_analyzer exposes get_embeddings_array; sample rate/model load uses the separate `birdnet` library (birdnet-team).
-# tensorflow is pulled transitively by birdnet + birdnet-analyzer (prefer >=2.20 for Analyzer 2.4.x).
-birdnet-analyzer>=2.4,<4
+# BirdNET embeddings + optional synth verification: PyPI package `birdnet` (TensorFlow backend).
+# Override device with env BIRDCLEF_BIRDNET_DEVICE=CPU|GPU:0 (defaults to CPU).
 birdnet>=0.2.5,<1
 
 # Scratch mel-CNN training

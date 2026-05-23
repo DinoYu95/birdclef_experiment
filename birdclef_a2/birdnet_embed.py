@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -11,19 +13,54 @@ from birdclef_a2.manifest_utils import assert_manifest_columns, resolve_audio_pa
 
 logger = logging.getLogger(__name__)
 
+# TensorFlow acoustic (ProtoBuf) BirdNET 2.4 — lazily loaded once.
+_ACOUSTIC_MODEL: Any | None = None
+
+
+def birdnet_inference_device() -> str:
+    """e.g. `CPU` or `GPU:0` — set `BIRDCLEF_BIRDNET_DEVICE` to override."""
+    return os.environ.get("BIRDCLEF_BIRDNET_DEVICE", "CPU")
+
+
+def acoustic_birdnet_model() -> Any:
+    """Shared BirdNET acoustic 2.4 TF weights (used for embeddings and optional synth verify)."""
+    return _acoustic_tf_model()
+
+
+def _acoustic_tf_model() -> Any:
+    global _ACOUSTIC_MODEL
+    if _ACOUSTIC_MODEL is None:
+        try:
+            import birdnet
+        except ImportError as e:  # pragma: no cover
+            raise ImportError(
+                "BirdNET embeddings require the PyPI `birdnet` package "
+                "(Cornell birdnet-team): pip install 'birdnet>=0.2.5'"
+            ) from e
+        _ACOUSTIC_MODEL = birdnet.load("acoustic", "2.4", "tf")
+    return _ACOUSTIC_MODEL
+
 
 def birdnet_sample_rate() -> int:
-    """BirdNET acoustic TF model sample rate (downloads weights on first call)."""
-    try:
-        import birdnet
-    except ImportError as e:  # pragma: no cover
-        raise ImportError(
-            "Missing the `birdnet` package (distinct from birdnet-analyzer). "
-            "Install: pip install birdnet-analyzer birdnet"
-        ) from e
+    """Sample rate expected by BirdNET acoustic TF 2.4 (model download on first load)."""
+    m = acoustic_birdnet_model()
+    return int(m.get_sample_rate())
 
-    model = birdnet.load("acoustic", "2.4", "tf")
-    return int(model.get_sample_rate())
+
+def _pool_segments_from_encoding_result(res: Any, input_idx: int) -> np.ndarray | None:
+    """One row = one embedding vector (mean over valid internal 3 s windows for this input)."""
+    emb = np.asarray(res.embeddings[input_idx])
+    mask = np.asarray(res.embeddings_masked[input_idx])
+    if emb.ndim != 2 or emb.size == 0:
+        return None
+    if mask.ndim >= 2:
+        ok = ~mask.all(axis=-1)
+    else:
+        ok = ~mask.astype(bool, copy=False)
+    rows = emb[ok]
+    if rows.size == 0:
+        return None
+    return np.mean(rows.astype(np.float64), axis=0).astype(np.float32)
 
 
 def compute_file_embedding(
@@ -34,7 +71,7 @@ def compute_file_embedding(
     overlap_s: float,
     embed_batch_segments: int,
 ) -> np.ndarray | None:
-    from birdnet_analyzer.model_utils import get_embeddings_array
+    model = acoustic_birdnet_model()
 
     try:
         wav = load_audio_mono(audio_path, sample_rate=sample_rate)
@@ -48,13 +85,27 @@ def compute_file_embedding(
     if not segments:
         return None
 
-    embs: list[np.ndarray] = []
-    for i in range(0, len(segments), embed_batch_segments):
-        chunk = segments[i : i + embed_batch_segments]
-        arr = get_embeddings_array(chunk, batch_size=min(len(chunk), embed_batch_segments))
-        embs.append(arr)
-    stacked = np.concatenate(embs, axis=0)
-    return stacked.mean(axis=0)
+    pooled: list[np.ndarray] = []
+    bsz = embed_batch_segments
+    for i in range(0, len(segments), bsz):
+        batch = segments[i : i + bsz]
+        inputs = [(np.asarray(seg, dtype=np.float32), sample_rate) for seg in batch]
+        res = model.encode_arrays(
+            inputs,
+            batch_size=min(len(inputs), bsz),
+            overlap_duration_s=0.0,
+            half_precision=False,
+            show_stats=None,
+            device=birdnet_inference_device(),
+        )
+        for j in range(len(inputs)):
+            vec = _pool_segments_from_encoding_result(res, j)
+            if vec is not None:
+                pooled.append(vec)
+
+    if not pooled:
+        return None
+    return np.mean(np.stack(pooled, axis=0), axis=0).astype(np.float32)
 
 
 def manifest_to_embeddings_npz(

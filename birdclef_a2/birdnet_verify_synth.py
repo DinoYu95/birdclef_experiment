@@ -1,8 +1,7 @@
 """BirdNET verification for synthetic wav files (classification output, not embeddings).
 
-`birdnet_analyzer.model_utils.run_inference` runs the **species classifier** and returns
-structured results (`to_dataframe()`). That is **not** the same as `get_embeddings_array`,
-which returns fixed-length feature vectors for sklearn.
+Uses the PyPI `birdnet` package `AcousticModelV2_4.predict()` (species scores), **not**
+the embedding vectors used by `birdnet_embed.py`.
 
 For filtering synthetic clips we match **predicted species text** (plus confidence) against
 taxonomy `scientific_name` / `common_name`. This aligns with the assignment hint:
@@ -16,7 +15,22 @@ from pathlib import Path
 
 import pandas as pd
 
+from birdclef_a2.birdnet_embed import acoustic_birdnet_model, birdnet_inference_device
+
 logger = logging.getLogger(__name__)
+
+
+def _prediction_result_to_df(pr) -> pd.DataFrame:
+    if hasattr(pr, "to_arrow_table"):
+        tbl = pr.to_arrow_table()
+        try:
+            return tbl.to_pandas()
+        except Exception:  # pragma: no cover
+            return pd.DataFrame(tbl.to_pylist())
+    if hasattr(pr, "to_structured_array"):
+        sa = pr.to_structured_array()
+        return pd.DataFrame.from_records(sa)
+    raise TypeError(f"Unhandled BirdNET prediction type: {type(pr)!r}")
 
 
 def _df_species_confidence_pairs(df: pd.DataFrame) -> list[tuple[str, float]]:
@@ -87,21 +101,25 @@ def synthetic_passes_birdnet_classifier(
     """
     Returns True if any BirdNET prediction row matches taxonomy strings above thresholds.
 
-    `run_min_confidence` is passed into `run_inference` (model-side filter).
-    `row_min_confidence` filters rows after `to_dataframe()` (post-hoc).
+    `run_min_confidence` maps to BirdNET `default_confidence_threshold`.
+    `row_min_confidence` filters rows after building a DataFrame (post-hoc).
     """
     try:
-        from birdnet_analyzer.model_utils import run_inference
+        model = acoustic_birdnet_model()
     except ImportError as e:  # pragma: no cover
-        raise ImportError("Install birdnet-analyzer for --verify-birdnet") from e
+        raise ImportError(
+            "Install PyPI `birdnet` for --verify-birdnet: pip install 'birdnet>=0.2.5'"
+        ) from e
 
-    res = run_inference(
+    pr = model.predict(
         str(wav_path),
         top_k=top_k,
         batch_size=1,
-        min_confidence=run_min_confidence,
+        default_confidence_threshold=run_min_confidence,
+        show_stats=None,
+        device=birdnet_inference_device(),
     )
-    df = res.to_dataframe()
+    df = _prediction_result_to_df(pr)
     pairs = _df_species_confidence_pairs(df)
     if not pairs:
         logger.warning("BirdNET returned no species rows for %s", wav_path)
