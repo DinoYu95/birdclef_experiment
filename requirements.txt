@@ -15,7 +15,8 @@ librosa>=0.11,<0.13
 soundfile>=0.12,<0.15
 
 # BirdNET embeddings + optional synth verification: PyPI package `birdnet` (TensorFlow backend).
-# Override device with env BIRDCLEF_BIRDNET_DEVICE=CPU|GPU:0 (defaults to CPU).
+# Override device with env BIRDCLEF_BIRDNET_DEVICE=CPU|GPU:0 or cli_embed --birdnet-device GPU:0 (defaults to CPU).
+# Linux + NVIDIA GPU: install CUDA-capable TF, e.g. pip install 'birdnet[and-cuda]' — see README / RUNBOOK.
 birdnet>=0.2.5,<1
 
 # Scratch mel-CNN training

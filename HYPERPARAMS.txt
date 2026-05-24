@@ -48,6 +48,7 @@ HYPERPARAMETERS BY METHOD (what you can tune + how)
      --segment-s           window length (e.g. 2.0 / 3.0 / 5.0 s)
      --overlap-s           more overlap => more segments => smoother mean pooling
      --embed-batch-segments VRAM/CPU time tradeoff
+     --birdnet-device      e.g. GPU:0 or CPU (or set env BIRDCLEF_BIRDNET_DEVICE)
      --limit-rows          debug only; remove for final numbers
    Tuning idea: small grid (2 segment_s x 2 overlap) -> report best val macro_f1.
 

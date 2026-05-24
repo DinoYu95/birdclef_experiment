@@ -125,6 +125,8 @@ def manifest_to_embeddings_npz(
     if label_col not in df.columns:
         raise KeyError(f"missing {label_col}")
 
+    logger.info("BirdNET device: %s", birdnet_inference_device())
+
     sr = birdnet_sample_rate()
     xs: list[np.ndarray] = []
     ys: list[str] = []
