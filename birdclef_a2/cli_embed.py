@@ -40,10 +40,18 @@ def main() -> None:
         help="BirdNET inference device: CPU, GPU:0, etc. GPU maps to protobuf backend (CUDA TF); "
         "CPU uses tf-lite path. If omitted, uses env BIRDCLEF_BIRDNET_DEVICE or CPU.",
     )
+    p.add_argument(
+        "--birdnet-force-tf-cpu",
+        action="store_true",
+        help="Use backend=tf (CPU-only) even if --birdnet-device GPU:0 — work around CUDA/cuDNN "
+        "errors like 'No DNN support for stream' on misconfigured renters.",
+    )
     args = p.parse_args()
 
     if args.birdnet_device is not None:
         os.environ["BIRDCLEF_BIRDNET_DEVICE"] = args.birdnet_device
+    if args.birdnet_force_tf_cpu:
+        os.environ["BIRDCLEF_BIRDNET_FORCE_TF_CPU"] = "1"
 
     bk, sess = birdnet_backend_and_session_device()
     logging.getLogger(__name__).info(

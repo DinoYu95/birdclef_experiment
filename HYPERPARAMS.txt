@@ -49,7 +49,15 @@ HYPERPARAMETERS BY METHOD (what you can tune + how)
      --overlap-s           more overlap => more segments => smoother mean pooling
      --embed-batch-segments VRAM/CPU time tradeoff
      --birdnet-device      GPU:0 selects protobuf SavedModel backend (CUDA TF); omit = tf-lite path CPU
+     --birdnet-force-tf-cpu Ignore GPU / use tf backend CPU (fix "No DNN support for stream" on bad stacks)
      --limit-rows          debug only; remove for final numbers
+   Troubleshooting (GPU protobuf path):
+     "No DNN support for stream" @ FusedBatchNormV3 = TensorFlow lacks working cuDNN for your driver/CUDA.
+     Fix NVIDIA stack (driver + CUDA-matched tensorflow, e.g. pip install 'birdnet[and-cuda]') or force CPU flags above.
+     pthread_create / "can't start new thread" / worker failures = container thread or PID cgroup too tight; defaults now use
+       n_workers=1, n_producers=1 in encode_arrays, and TF_NUM_INTEROP/INTRA_OP threads capped unless BIRDCLEF_TF_NO_THREAD_CAPS=1.
+     If BirdNET asserts len(physical_devices)==1 when multiple GPUs are visible on host: export CUDA_VISIBLE_DEVICES=0
+       (otherwise we set it by default only when unset).
    Tuning idea: small grid (2 segment_s x 2 overlap) -> report best val macro_f1.
 
 3) SKLEARN ON EMBEDDINGS  (python -m birdclef_a2.cli_sklearn_train)

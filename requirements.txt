@@ -16,7 +16,7 @@ soundfile>=0.12,<0.15
 
 # BirdNET embeddings + optional synth verification: PyPI package `birdnet` (TensorFlow backend).
 # Override device with env BIRDCLEF_BIRDNET_DEVICE=CPU|GPU:0 or cli_embed --birdnet-device GPU:0 (defaults to CPU).
-# GPU:TF must see CUDA; acoustic path uses protobuf backend "pb" automatically when env is GPU*.
+# GPU issues (e.g. FusedBatchNorm / "No DNN support for stream"): unset GPU or BIRDCLEF_BIRDNET_FORCE_TF_CPU=1.
 birdnet>=0.2.5,<1
 
 # Scratch mel-CNN training

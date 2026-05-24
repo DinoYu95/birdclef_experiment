@@ -17,6 +17,34 @@ logger = logging.getLogger(__name__)
 _ACOUSTIC_MODEL_CACHE: dict[tuple[str, str], Any] = {}
 
 
+def _env_truthy(name: str) -> bool:
+    v = os.environ.get(name, "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _maybe_apply_tf_thread_caps() -> None:
+    """Keep TF Eigen pools small so cgroup-low ``ulimit`` / ``pids.max`` hosts don't explode.
+
+    Set ``BIRDCLEF_TF_NO_THREAD_CAPS=1`` or override ``TF_*`` yourself to disable defaults.
+    """
+    if _env_truthy("BIRDCLEF_TF_NO_THREAD_CAPS"):
+        return
+    os.environ.setdefault("TF_NUM_INTEROP_THREADS", "2")
+    os.environ.setdefault("TF_NUM_INTRA_OP_THREADS", "2")
+
+
+def _maybe_pin_single_cuda_device_for_pb() -> None:
+    """BirdNET ``set_gpu_device_tf`` asserts exactly one TF-visible GPU."""
+
+    bk, _ = birdnet_backend_and_session_device()
+    if bk != "pb":
+        return
+    existing = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if existing is not None and str(existing).strip() != "":
+        return
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
+
 def birdnet_inference_device() -> str:
     """Raw selection from ``BIRDCLEF_BIRDNET_DEVICE`` or CLI (e.g. ``CPU``, ``GPU:0``)."""
     return os.environ.get("BIRDCLEF_BIRDNET_DEVICE", "CPU").strip()
@@ -29,7 +57,18 @@ def birdnet_backend_and_session_device() -> tuple[str, str]:
 
     Strings like ``GPU:0`` (or bare ``gpu`` → ``GPU:0``) use ``backend=="pb"`` (TensorFlow
     SavedModel) so NVIDIA GPUs work when CUDA-enabled TensorFlow is installed.
+
+    Set ``BIRDCLEF_BIRDNET_FORCE_TF_CPU=1`` (or CLI ``--birdnet-force-tf-cpu``) to always use
+    the slower ``tf`` CPU path — e.g. when GPU fails with cuDNN errors such as **No DNN support for stream**.
     """
+    if _env_truthy("BIRDCLEF_BIRDNET_FORCE_TF_CPU"):
+        raw = birdnet_inference_device()
+        if raw.lower().startswith(("gpu", "cuda")):
+            logger.warning(
+                "BIRDCLEF_BIRDNET_FORCE_TF_CPU: ignoring GPU device %r; using backend=tf on CPU.",
+                raw,
+            )
+        return ("tf", "CPU")
     raw = birdnet_inference_device()
     lowered = raw.lower()
     if lowered.startswith(("gpu", "cuda")):
@@ -49,6 +88,8 @@ def _get_acoustic_model() -> Any:
     hit = _ACOUSTIC_MODEL_CACHE.get(cache_key)
     if hit is not None:
         return hit
+    _maybe_apply_tf_thread_caps()
+    _maybe_pin_single_cuda_device_for_pb()
     try:
         import birdnet
     except ImportError as e:  # pragma: no cover
@@ -130,7 +171,10 @@ def compute_file_embedding(
         inputs = [(np.asarray(seg, dtype=np.float32), sample_rate) for seg in batch]
         res = model.encode_arrays(
             inputs,
+            n_producers=1,
+            n_workers=1,
             batch_size=min(len(inputs), bsz),
+            prefetch_ratio=1,
             overlap_duration_s=0.0,
             half_precision=False,
             show_stats=None,

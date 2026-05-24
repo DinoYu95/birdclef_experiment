@@ -115,6 +115,8 @@ def synthetic_passes_birdnet_classifier(
         str(wav_path),
         top_k=top_k,
         batch_size=1,
+        n_producers=1,
+        n_workers=1,
         default_confidence_threshold=run_min_confidence,
         show_stats=None,
         device=birdnet_session_device(),
