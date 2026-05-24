@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from birdclef_a2.birdnet_embed import acoustic_birdnet_model, birdnet_inference_device
+from birdclef_a2.birdnet_embed import acoustic_birdnet_model, birdnet_session_device
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +117,7 @@ def synthetic_passes_birdnet_classifier(
         batch_size=1,
         default_confidence_threshold=run_min_confidence,
         show_stats=None,
-        device=birdnet_inference_device(),
+        device=birdnet_session_device(),
     )
     df = _prediction_result_to_df(pr)
     pairs = _df_species_confidence_pairs(df)

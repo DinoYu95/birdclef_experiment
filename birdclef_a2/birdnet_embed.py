@@ -13,36 +13,73 @@ from birdclef_a2.manifest_utils import assert_manifest_columns, resolve_audio_pa
 
 logger = logging.getLogger(__name__)
 
-# TensorFlow acoustic (ProtoBuf) BirdNET 2.4 — lazily loaded once.
-_ACOUSTIC_MODEL: Any | None = None
+# Lazy cache: PB (SavedModel) and TF (Lite path) bundles are different binaries.
+_ACOUSTIC_MODEL_CACHE: dict[tuple[str, str], Any] = {}
 
 
 def birdnet_inference_device() -> str:
-    """e.g. `CPU` or `GPU:0` — set `BIRDCLEF_BIRDNET_DEVICE` to override."""
-    return os.environ.get("BIRDCLEF_BIRDNET_DEVICE", "CPU")
+    """Raw selection from ``BIRDCLEF_BIRDNET_DEVICE`` or CLI (e.g. ``CPU``, ``GPU:0``)."""
+    return os.environ.get("BIRDCLEF_BIRDNET_DEVICE", "CPU").strip()
+
+
+def birdnet_backend_and_session_device() -> tuple[str, str]:
+    """Return ``(backend, session_device)`` for ``birdnet.load``.
+
+    ``backend=="tf"`` uses the Lite-style stack in `birdnet` and only supports **CPU** inference.
+
+    Strings like ``GPU:0`` (or bare ``gpu`` → ``GPU:0``) use ``backend=="pb"`` (TensorFlow
+    SavedModel) so NVIDIA GPUs work when CUDA-enabled TensorFlow is installed.
+    """
+    raw = birdnet_inference_device()
+    lowered = raw.lower()
+    if lowered.startswith(("gpu", "cuda")):
+        session = raw if lowered != "gpu" else "GPU:0"
+        return ("pb", session)
+    return ("tf", "CPU")
+
+
+def birdnet_session_device() -> str:
+    """Device passed to ``encode_arrays`` / ``predict`` — always ``CPU`` when backend is ``tf``."""
+    return birdnet_backend_and_session_device()[1]
+
+
+def _get_acoustic_model() -> Any:
+    bk, session_key = birdnet_backend_and_session_device()
+    cache_key = (bk, session_key)
+    hit = _ACOUSTIC_MODEL_CACHE.get(cache_key)
+    if hit is not None:
+        return hit
+    try:
+        import birdnet
+    except ImportError as e:  # pragma: no cover
+        raise ImportError(
+            "BirdNET requires PyPI package `birdnet` (Cornell): pip install 'birdnet>=0.2.5'"
+        ) from e
+    if bk == "tf":
+        model = birdnet.load("acoustic", "2.4", "tf")
+    elif bk == "pb":
+        model = birdnet.load("acoustic", "2.4", "pb")
+    else:  # pragma: no cover
+        raise AssertionError(bk)
+    _ACOUSTIC_MODEL_CACHE[cache_key] = model
+    raw_disp = birdnet_inference_device()
+    logger.info(
+        "Loaded BirdNET acoustic 2.4: backend=%s session_device=%s "
+        "(BIRDCLEF_BIRDNET_DEVICE=%r)",
+        bk,
+        session_key,
+        raw_disp,
+    )
+    return model
 
 
 def acoustic_birdnet_model() -> Any:
-    """Shared BirdNET acoustic 2.4 TF weights (used for embeddings and optional synth verify)."""
-    return _acoustic_tf_model()
-
-
-def _acoustic_tf_model() -> Any:
-    global _ACOUSTIC_MODEL
-    if _ACOUSTIC_MODEL is None:
-        try:
-            import birdnet
-        except ImportError as e:  # pragma: no cover
-            raise ImportError(
-                "BirdNET embeddings require the PyPI `birdnet` package "
-                "(Cornell birdnet-team): pip install 'birdnet>=0.2.5'"
-            ) from e
-        _ACOUSTIC_MODEL = birdnet.load("acoustic", "2.4", "tf")
-    return _ACOUSTIC_MODEL
+    """Shared BirdNET acoustic 2.4 model (PB+GPU when requested, otherwise TF-lite path @ CPU)."""
+    return _get_acoustic_model()
 
 
 def birdnet_sample_rate() -> int:
-    """Sample rate expected by BirdNET acoustic TF 2.4 (model download on first load)."""
+    """Sample rate expected by BirdNET acoustic v2.4 (weights download on first load)."""
     m = acoustic_birdnet_model()
     return int(m.get_sample_rate())
 
@@ -85,6 +122,7 @@ def compute_file_embedding(
     if not segments:
         return None
 
+    sess_dev = birdnet_session_device()
     pooled: list[np.ndarray] = []
     bsz = embed_batch_segments
     for i in range(0, len(segments), bsz):
@@ -96,7 +134,7 @@ def compute_file_embedding(
             overlap_duration_s=0.0,
             half_precision=False,
             show_stats=None,
-            device=birdnet_inference_device(),
+            device=sess_dev,
         )
         for j in range(len(inputs)):
             vec = _pool_segments_from_encoding_result(res, j)
@@ -125,7 +163,13 @@ def manifest_to_embeddings_npz(
     if label_col not in df.columns:
         raise KeyError(f"missing {label_col}")
 
-    logger.info("BirdNET device: %s", birdnet_inference_device())
+    bk, sess = birdnet_backend_and_session_device()
+    logger.info(
+        "BirdNET embedding: backend=%s session_device=%s (BIRDCLEF_BIRDNET_DEVICE=%s)",
+        bk,
+        sess,
+        birdnet_inference_device(),
+    )
 
     sr = birdnet_sample_rate()
     xs: list[np.ndarray] = []

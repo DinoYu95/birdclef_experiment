@@ -6,7 +6,11 @@ import logging
 import os
 from pathlib import Path
 
-from birdclef_a2.birdnet_embed import birdnet_inference_device, manifest_to_embeddings_npz
+from birdclef_a2.birdnet_embed import (
+    birdnet_backend_and_session_device,
+    birdnet_inference_device,
+    manifest_to_embeddings_npz,
+)
 from birdclef_a2.config import load_layout
 from birdclef_a2.report_exports import write_json
 
@@ -33,16 +37,20 @@ def main() -> None:
         "--birdnet-device",
         default=None,
         metavar="DEVICE",
-        help="Passed to BirdNET/TensorFlow (e.g. GPU:0). "
-        "If omitted, uses env BIRDCLEF_BIRDNET_DEVICE or CPU.",
+        help="BirdNET inference device: CPU, GPU:0, etc. GPU maps to protobuf backend (CUDA TF); "
+        "CPU uses tf-lite path. If omitted, uses env BIRDCLEF_BIRDNET_DEVICE or CPU.",
     )
     args = p.parse_args()
 
     if args.birdnet_device is not None:
         os.environ["BIRDCLEF_BIRDNET_DEVICE"] = args.birdnet_device
 
+    bk, sess = birdnet_backend_and_session_device()
     logging.getLogger(__name__).info(
-        "BirdNET device (set before first inference): %s", birdnet_inference_device()
+        "BirdNET backend=%s session_device=%s (BIRDCLEF_BIRDNET_DEVICE=%r)",
+        bk,
+        sess,
+        birdnet_inference_device(),
     )
 
     layout = load_layout(args.data_root)
