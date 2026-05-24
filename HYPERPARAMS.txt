@@ -58,6 +58,10 @@ HYPERPARAMETERS BY METHOD (what you can tune + how)
        n_workers=1, n_producers=1 in encode_arrays, and TF_NUM_INTEROP/INTRA_OP threads capped unless BIRDCLEF_TF_NO_THREAD_CAPS=1.
      If BirdNET asserts len(physical_devices)==1 when multiple GPUs are visible on host: export CUDA_VISIBLE_DEVICES=0
        (otherwise we set it by default only when unset).
+     cli_embed merges all segment windows **per audio file into one BirdNET encode session** by default so tiny cgroups don't
+       fork a new multiprocessing pipe per overlap window. Tune ``BIRDCLEF_EMBED_ENCODE_SEGMENT_CHUNK`` (e.g. 256) if OOM.
+     Run embedding with the project interpreter only: ``.venv/bin/python -m birdclef_a2.cli_embed ...`` — avoid conda ``(main)``
+       pulling ``/venv/main/lib`` stdlib/logging next to `.venv` site-packages (mixed installs confuse debugging).
    Tuning idea: small grid (2 segment_s x 2 overlap) -> report best val macro_f1.
 
 3) SKLEARN ON EMBEDDINGS  (python -m birdclef_a2.cli_sklearn_train)

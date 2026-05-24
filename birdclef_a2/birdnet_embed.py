@@ -31,6 +31,10 @@ def _maybe_apply_tf_thread_caps() -> None:
         return
     os.environ.setdefault("TF_NUM_INTEROP_THREADS", "2")
     os.environ.setdefault("TF_NUM_INTRA_OP_THREADS", "2")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 
 def _maybe_pin_single_cuda_device_for_pb() -> None:
@@ -141,6 +145,19 @@ def _pool_segments_from_encoding_result(res: Any, input_idx: int) -> np.ndarray 
     return np.mean(rows.astype(np.float64), axis=0).astype(np.float32)
 
 
+def _embed_segment_inputs_chunk_cap() -> int:
+    """Each ``encode_arrays`` opens a multiprocessing-heavy BirdNET session.
+
+    Default: encode **all segments of one file** in one call (minimal sessions).
+    If one file yields huge segment counts / OOM, set ``BIRDCLEF_EMBED_ENCODE_SEGMENT_CHUNK``
+    e.g. ``256``.
+    """
+    raw = os.environ.get("BIRDCLEF_EMBED_ENCODE_SEGMENT_CHUNK", "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return 999_999
+
+
 def compute_file_embedding(
     audio_path: Path,
     *,
@@ -164,23 +181,25 @@ def compute_file_embedding(
         return None
 
     sess_dev = birdnet_session_device()
+    # One BirdNET encode session per chunk — NOT per segment-batch (would fork workers endlessly).
+    inputs_all = [(np.asarray(seg, dtype=np.float32), sample_rate) for seg in segments]
+    cap = _embed_segment_inputs_chunk_cap()
     pooled: list[np.ndarray] = []
-    bsz = embed_batch_segments
-    for i in range(0, len(segments), bsz):
-        batch = segments[i : i + bsz]
-        inputs = [(np.asarray(seg, dtype=np.float32), sample_rate) for seg in batch]
+
+    for c0 in range(0, len(inputs_all), cap):
+        chunk = inputs_all[c0 : c0 + cap]
         res = model.encode_arrays(
-            inputs,
+            chunk,
             n_producers=1,
             n_workers=1,
-            batch_size=min(len(inputs), bsz),
+            batch_size=min(len(chunk), embed_batch_segments),
             prefetch_ratio=1,
             overlap_duration_s=0.0,
             half_precision=False,
             show_stats=None,
             device=sess_dev,
         )
-        for j in range(len(inputs)):
+        for j in range(len(chunk)):
             vec = _pool_segments_from_encoding_result(res, j)
             if vec is not None:
                 pooled.append(vec)
