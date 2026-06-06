@@ -234,7 +234,17 @@ class TrainLabelCentroidCache:
         self.segment_s = segment_s
         self._df = pd.read_csv(self.train_manifest)
         self._cache: dict[str, np.ndarray | None] = {}
-        self._sr = birdnet_sample_rate()
+        self._sr: int | None = None
+
+    def _sample_rate(self) -> int:
+        if self._sr is None:
+            self._sr = birdnet_sample_rate()
+        return self._sr
+
+    def prewarm(self, labels: list[str]) -> None:
+        """Build centroids for all labels before loading other GPU models (e.g. AudioLDM2)."""
+        for lab in labels:
+            self.get(lab)
 
     def get(self, primary_label: str) -> np.ndarray | None:
         lab = str(primary_label)
@@ -260,11 +270,12 @@ class TrainLabelCentroidCache:
             self._cache[lab] = None
             return None
 
+        sr = self._sample_rate()
         vecs: list[np.ndarray] = []
         for p in paths:
             emb = compute_file_embedding(
                 p,
-                sample_rate=self._sr,
+                sample_rate=sr,
                 segment_s=self.segment_s,
                 overlap_s=0.0,
                 embed_batch_segments=1,

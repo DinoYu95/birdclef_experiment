@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 import pandas as pd
@@ -84,6 +85,28 @@ def birdnet_backend_and_session_device() -> tuple[str, str]:
 def birdnet_session_device() -> str:
     """Device passed to ``encode_arrays`` / ``predict`` — always ``CPU`` when backend is ``tf``."""
     return birdnet_backend_and_session_device()[1]
+
+
+def clear_acoustic_model_cache() -> None:
+    """Drop cached BirdNET acoustic models (e.g. after switching verify device)."""
+    _ACOUSTIC_MODEL_CACHE.clear()
+
+
+@contextmanager
+def birdnet_device_context(device: str) -> Iterator[None]:
+    """Temporarily set ``BIRDCLEF_BIRDNET_DEVICE`` and reload models on context exit."""
+    key = "BIRDCLEF_BIRDNET_DEVICE"
+    prev = os.environ.get(key)
+    os.environ[key] = device.strip()
+    clear_acoustic_model_cache()
+    try:
+        yield
+    finally:
+        clear_acoustic_model_cache()
+        if prev is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = prev
 
 
 def _get_acoustic_model() -> Any:

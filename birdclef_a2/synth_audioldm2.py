@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from birdclef_a2.birdnet_embed import birdnet_device_context
 from birdclef_a2.birdnet_verify_synth import (
     DEFAULT_NEGATIVE_PROMPT,
     TrainLabelCentroidCache,
@@ -239,6 +240,7 @@ def generate_balanced_synthetic_manifest(
     verify_mode: str,
     verify_embed_min_cosine: float,
     verify_centroid_max_samples: int,
+    verify_birdnet_device: str,
     verify_only_bird_classes: bool,
     negative_prompt: str,
     dtype: str,
@@ -316,156 +318,171 @@ def generate_balanced_synthetic_manifest(
     rng = np.random.default_rng(seed)
 
     centroid_cache: TrainLabelCentroidCache | None = None
-    if verify_birdnet and verify_mode.strip().lower() in ("embed", "both", "either"):
-        centroid_cache = TrainLabelCentroidCache(
-            train_manifest=train_manifest,
-            data_root=data_root,
-            label_col=label_col,
-            max_samples=verify_centroid_max_samples,
+    verify_dev = verify_birdnet_device.strip() or "CPU"
+    if verify_birdnet and verify_dev.lower().startswith(("gpu", "cuda")):
+        logger.warning(
+            "BirdNET verify device=%r can conflict with AudioLDM2 CUDA; "
+            "recommend --birdnet-device CPU for synthesis runs.",
+            verify_dev,
         )
 
     torch_dtype = torch.float16 if dtype == "fp16" else torch.float32
-    pipe = _load_audioldm2_pipeline(hf_model_id, torch_dtype)
 
-    if torch.cuda.is_available():
-        pipe = pipe.to("cuda")
-        try:
-            pipe.enable_attention_slicing()
-        except Exception:  # pragma: no cover
-            pass
-    else:
-        pipe.enable_model_cpu_offload()
-
-    try:
-        sr = int(pipe.vocoder.config.sampling_rate)
-    except Exception:
-        sr = 16000
-
-    import soundfile as sf
-
-    logger.info(
-        "Resume plan: target=%s labels=%s slots=%s existing_manifest=%s start_label=%s only_aves=%s",
-        tgt,
-        len(items),
-        total_new,
-        existing_manifest,
-        start_label,
-        only_aves,
-    )
-
-    done = 0
-    n_rejected = 0
-    vocal_hints_cache: dict[str, list[str]] = {}
-
-    for lab, need in items:
-        subdir = out_audio_dir / lab
-        subdir.mkdir(parents=True, exist_ok=True)
-
-        sci_n = primary_to_sci.get(lab, "")
-        com_n = primary_to_common.get(lab, "")
-        cls_name = primary_to_class.get(lab, "")
-        if lab not in vocal_hints_cache:
-            vocal_hints_cache[lab] = vocalization_hints_for_label(
-                train_manifest, label_col=label_col, primary_label=lab
+    with birdnet_device_context(verify_dev):
+        if verify_birdnet and verify_mode.strip().lower() in ("embed", "both", "either"):
+            centroid_cache = TrainLabelCentroidCache(
+                train_manifest=train_manifest,
+                data_root=data_root,
+                label_col=label_col,
+                max_samples=verify_centroid_max_samples,
             )
-        vocal_hints = vocal_hints_cache[lab]
-        centroid = centroid_cache.get(lab) if centroid_cache is not None else None
-        run_birdnet_verify = bool(verify_birdnet) and (
-            not verify_only_bird_classes or _taxon_is_bird(cls_name)
-        )
-        if verify_birdnet and verify_only_bird_classes and not _taxon_is_bird(cls_name):
             logger.info(
-                "BirdNET verify skipped for non-Aves taxon %s (class_name=%r)",
-                lab,
-                cls_name,
+                "Pre-building BirdNET centroids for %s labels on device=%s …",
+                len(items),
+                verify_dev,
             )
-        if (
-            run_birdnet_verify
-            and verify_mode.strip().lower() in ("embed", "both")
-            and centroid is None
-        ):
-            logger.warning(
-                "label %s: no train centroid for embed verify — slots will fail embed check",
-                lab,
-            )
+            centroid_cache.prewarm([lab for lab, _ in items])
 
-        produced = 0
-        attempts = 0
-        tries_per_slot = verify_max_retries if run_birdnet_verify else 1
+        pipe = _load_audioldm2_pipeline(hf_model_id, torch_dtype)
 
-        # One "slot" = one deficit clip. Up to tries_per_slot generations per slot;
-        # if all tries fail, move on. Never spend more than need * tries_per_slot
-        # attempts on a single label (avoids infinite retry on hard taxa).
-        for _slot in range(need):
-            vocal = vocal_hints[int(rng.integers(0, len(vocal_hints)))]
-            prompt = prompt_for_taxon(
-                lab,
-                primary_to_common=primary_to_common,
-                primary_to_sci=primary_to_sci,
-                class_name=cls_name,
-                vocalization=vocal,
-                rng=rng,
-            )
-            for _try in range(tries_per_slot):
-                attempts += 1
-                fname = f"{uuid.uuid4().hex}.wav"
-                out_wav = subdir / fname
+        if torch.cuda.is_available():
+            pipe = pipe.to("cuda")
+            try:
+                pipe.enable_attention_slicing()
+            except Exception:  # pragma: no cover
+                pass
+        else:
+            pipe.enable_model_cpu_offload()
 
-                pipe_kwargs: dict = {
-                    "audio_length_in_s": float(audio_seconds),
-                    "num_inference_steps": int(inference_steps),
-                }
-                if negative_prompt.strip():
-                    pipe_kwargs["negative_prompt"] = negative_prompt
+        try:
+            sr = int(pipe.vocoder.config.sampling_rate)
+        except Exception:
+            sr = 16000
 
-                out = pipe(prompt, **pipe_kwargs)
-                audio = np.asarray(out.audios[0], dtype=np.float32)
+        import soundfile as sf
 
-                sf.write(out_wav, audio, sr)
+        logger.info(
+            "Resume plan: target=%s labels=%s slots=%s existing_manifest=%s "
+            "start_label=%s only_aves=%s birdnet_verify_device=%s",
+            tgt,
+            len(items),
+            total_new,
+            existing_manifest,
+            start_label,
+            only_aves,
+            verify_dev,
+        )
 
-                if run_birdnet_verify:
-                    ok = synthetic_passes_birdnet_verify(
-                        out_wav,
-                        verify_mode=verify_mode,
-                        scientific_name=sci_n,
-                        common_name=com_n,
-                        centroid=centroid,
-                        top_k=verify_top_k,
-                        run_min_confidence=verify_run_min_confidence,
-                        row_min_confidence=verify_row_min_confidence,
-                        embed_min_cosine=verify_embed_min_cosine,
-                    )
-                    if not ok:
-                        n_rejected += 1
-                        try:
-                            out_wav.unlink()
-                        except OSError:
-                            pass
-                        continue
+        done = 0
+        n_rejected = 0
+        vocal_hints_cache: dict[str, list[str]] = {}
 
-                rel_path = Path(out_wav).resolve().relative_to(
-                    Path(data_root).resolve()
+        for lab, need in items:
+            subdir = out_audio_dir / lab
+            subdir.mkdir(parents=True, exist_ok=True)
+
+            sci_n = primary_to_sci.get(lab, "")
+            com_n = primary_to_common.get(lab, "")
+            cls_name = primary_to_class.get(lab, "")
+            if lab not in vocal_hints_cache:
+                vocal_hints_cache[lab] = vocalization_hints_for_label(
+                    train_manifest, label_col=label_col, primary_label=lab
                 )
-                rows.append({"filename": rel_path.as_posix(), label_col: lab})
-                produced += 1
-                done += 1
-                if done % 10 == 0:
-                    logger.info("synthetic accepted %s / ~%s total", done, total_new)
-                break
-
-        if produced < need:
-            logger.warning(
-                "label %s: filled %s/%s slots (%s slots exhausted all %s tries; "
-                "total_attempts=%s verify=%s mode=%s)",
-                lab,
-                produced,
-                need,
-                need - produced,
-                tries_per_slot,
-                attempts,
-                verify_birdnet,
-                verify_mode,
+            vocal_hints = vocal_hints_cache[lab]
+            centroid = centroid_cache.get(lab) if centroid_cache is not None else None
+            run_birdnet_verify = bool(verify_birdnet) and (
+                not verify_only_bird_classes or _taxon_is_bird(cls_name)
             )
+            if verify_birdnet and verify_only_bird_classes and not _taxon_is_bird(cls_name):
+                logger.info(
+                    "BirdNET verify skipped for non-Aves taxon %s (class_name=%r)",
+                    lab,
+                    cls_name,
+                )
+            if (
+                run_birdnet_verify
+                and verify_mode.strip().lower() in ("embed", "both")
+                and centroid is None
+            ):
+                logger.warning(
+                    "label %s: no train centroid for embed verify — slots will fail embed check",
+                    lab,
+                )
+
+            produced = 0
+            attempts = 0
+            tries_per_slot = verify_max_retries if run_birdnet_verify else 1
+
+            for _slot in range(need):
+                vocal = vocal_hints[int(rng.integers(0, len(vocal_hints)))]
+                prompt = prompt_for_taxon(
+                    lab,
+                    primary_to_common=primary_to_common,
+                    primary_to_sci=primary_to_sci,
+                    class_name=cls_name,
+                    vocalization=vocal,
+                    rng=rng,
+                )
+                for _try in range(tries_per_slot):
+                    attempts += 1
+                    fname = f"{uuid.uuid4().hex}.wav"
+                    out_wav = subdir / fname
+
+                    pipe_kwargs: dict = {
+                        "audio_length_in_s": float(audio_seconds),
+                        "num_inference_steps": int(inference_steps),
+                    }
+                    if negative_prompt.strip():
+                        pipe_kwargs["negative_prompt"] = negative_prompt
+
+                    out = pipe(prompt, **pipe_kwargs)
+                    audio = np.asarray(out.audios[0], dtype=np.float32)
+
+                    sf.write(out_wav, audio, sr)
+
+                    if run_birdnet_verify:
+                        ok = synthetic_passes_birdnet_verify(
+                            out_wav,
+                            verify_mode=verify_mode,
+                            scientific_name=sci_n,
+                            common_name=com_n,
+                            centroid=centroid,
+                            top_k=verify_top_k,
+                            run_min_confidence=verify_run_min_confidence,
+                            row_min_confidence=verify_row_min_confidence,
+                            embed_min_cosine=verify_embed_min_cosine,
+                        )
+                        if not ok:
+                            n_rejected += 1
+                            try:
+                                out_wav.unlink()
+                            except OSError:
+                                pass
+                            continue
+
+                    rel_path = Path(out_wav).resolve().relative_to(
+                        Path(data_root).resolve()
+                    )
+                    rows.append({"filename": rel_path.as_posix(), label_col: lab})
+                    produced += 1
+                    done += 1
+                    if done % 10 == 0:
+                        logger.info("synthetic accepted %s / ~%s total", done, total_new)
+                    break
+
+            if produced < need:
+                logger.warning(
+                    "label %s: filled %s/%s slots (%s slots exhausted all %s tries; "
+                    "total_attempts=%s verify=%s mode=%s)",
+                    lab,
+                    produced,
+                    need,
+                    need - produced,
+                    tries_per_slot,
+                    attempts,
+                    verify_birdnet,
+                    verify_mode,
+                )
 
     out_manifest.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(out_manifest, index=False)

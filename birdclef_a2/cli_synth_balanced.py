@@ -80,8 +80,11 @@ def main() -> None:
     )
     p.add_argument(
         "--birdnet-device",
-        default=None,
-        help="BirdNET device for verify: CPU, GPU:0, etc. (env BIRDCLEF_BIRDNET_DEVICE).",
+        default="CPU",
+        help=(
+            "BirdNET device for verify/embed centroids. Default CPU — AudioLDM2 uses "
+            "PyTorch CUDA separately; TF BirdNET on GPU often crashes with CUDA_ERROR_NOT_INITIALIZED."
+        ),
     )
     p.add_argument(
         "--birdnet-force-tf-cpu",
@@ -146,8 +149,7 @@ def main() -> None:
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
-    if args.birdnet_device is not None:
-        os.environ["BIRDCLEF_BIRDNET_DEVICE"] = args.birdnet_device
+    os.environ["BIRDCLEF_BIRDNET_DEVICE"] = args.birdnet_device
     if args.birdnet_force_tf_cpu:
         os.environ["BIRDCLEF_BIRDNET_FORCE_TF_CPU"] = "1"
 
@@ -180,6 +182,7 @@ def main() -> None:
         verify_mode=args.verify_mode,
         verify_embed_min_cosine=args.verify_embed_min_cosine,
         verify_centroid_max_samples=args.verify_centroid_max_samples,
+        verify_birdnet_device=args.birdnet_device,
         verify_only_bird_classes=not args.verify_include_non_aves,
         negative_prompt=args.negative_prompt,
         dtype=args.dtype,
