@@ -25,6 +25,7 @@ torchaudio>=2.2,<3
 torchvision>=0.17,<1
 
 # Part B synthetic audio (AudioLDM2 / "AudioLM2" in briefs)
+# cvssp/audioldm2 needs GPT2LMHeadModel (see synth_audioldm2._load_audioldm2_pipeline); if load fails try transformers==4.47.0
 diffusers>=0.27,<1
 transformers>=4.40,<5
 accelerate>=0.28,<1

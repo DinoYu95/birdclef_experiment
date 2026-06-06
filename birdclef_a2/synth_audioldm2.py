@@ -76,6 +76,23 @@ def _taxon_is_bird(class_name: str) -> bool:
     return class_name.strip().lower() == "aves"
 
 
+def _load_audioldm2_pipeline(hf_model_id: str, torch_dtype):
+    """Load AudioLDM2 with ``GPT2LMHeadModel`` — newer ``transformers`` breaks ``GPT2Model`` in the HF repo."""
+    from diffusers import AudioLDM2Pipeline
+    from transformers import GPT2LMHeadModel
+
+    logger.info(
+        "Loading AudioLDM2 %s (language_model=GPT2LMHeadModel for transformers compat)",
+        hf_model_id,
+    )
+    lm = GPT2LMHeadModel.from_pretrained(
+        hf_model_id, subfolder="language_model", torch_dtype=torch_dtype
+    )
+    return AudioLDM2Pipeline.from_pretrained(
+        hf_model_id, torch_dtype=torch_dtype, language_model=lm
+    )
+
+
 def generate_balanced_synthetic_manifest(
     *,
     data_root: Path,
@@ -131,7 +148,6 @@ def generate_balanced_synthetic_manifest(
 
     try:
         import torch
-        from diffusers import AudioLDM2Pipeline
     except ImportError as e:  # pragma: no cover
         raise ImportError(
             "Synthetic generation requires: pip install diffusers transformers accelerate torch soundfile"
@@ -141,7 +157,7 @@ def generate_balanced_synthetic_manifest(
     np.random.seed(seed)
 
     torch_dtype = torch.float16 if dtype == "fp16" else torch.float32
-    pipe = AudioLDM2Pipeline.from_pretrained(hf_model_id, torch_dtype=torch_dtype)
+    pipe = _load_audioldm2_pipeline(hf_model_id, torch_dtype)
 
     if torch.cuda.is_available():
         pipe = pipe.to("cuda")
