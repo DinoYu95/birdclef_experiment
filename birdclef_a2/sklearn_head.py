@@ -31,16 +31,19 @@ def train_sklearn_classifier(
         clf = LogisticRegression(
             C=logreg_c,
             max_iter=logreg_max_iter,
-            multi_class="multinomial",
+            solver="lbfgs",
             class_weight="balanced",
             random_state=seed,
             n_jobs=-1,
         )
     elif model == "hgb":
+        # early_stopping splits train internally with stratify; singleton classes in
+        # BirdCLEF train trigger ValueError — use fixed max_iter instead.
         clf = HistGradientBoostingClassifier(
             max_depth=hgb_max_depth,
             learning_rate=hgb_learning_rate,
             max_iter=hgb_max_iter,
+            early_stopping=False,
             random_state=seed,
         )
     else:

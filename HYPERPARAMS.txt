@@ -19,6 +19,10 @@ cli_torch_train  -> same four val_* plus experiment_config.json
 
 cli_synth_balanced -> synthetic_experiment_config.json (under synthetic manifest folder)
 
+CSV clarity: cli_embed outputs only compressed .npz. If classmates say embeddings "produce no CSV", they mix steps:
+  downstream sklearn/torch summarize runs emit val_predictions.csv / metrics_comparison.csv. Failures usually mean broken
+  paths, unreadable NPZ, write permission/disk space, or a failed/empty embedding chunk — not a missing exporter in cli_embed.
+
 Aggregate for LaTeX/Word tables:
   python -m birdclef_a2.cli_summarize_runs \
     --rows A_logreg=outputs/A_sklearn_head B_hgb=outputs/A_hgb C_torch=outputs/A_torch \
@@ -50,12 +54,35 @@ HYPERPARAMETERS BY METHOD (what you can tune + how)
      --embed-batch-segments VRAM/CPU time tradeoff
      --birdnet-device      GPU:0 selects protobuf SavedModel backend (CUDA TF); omit = tf-lite path CPU
      --birdnet-force-tf-cpu Ignore GPU / use tf backend CPU (fix "No DNN support for stream" on bad stacks)
-     --limit-rows          debug only; remove for final numbers
+     --offset-rows         skip first N manifest rows (combine with chunk-rows or manual multi-run resume)
+     --limit-rows          cap total rows AFTER offset for this job (omit = through end); with --chunk-rows this caps the
+                             whole chunked span (not each pass)
+     --chunk-rows          one command does all passes of <=N manifest rows each, writes temp parts under <out>_parts/,
+                             merges into single --out-npz, deletes parts unless --chunk-keep-parts (same merged result as
+                             one uninterrupted run; merge step still loads full NPZ RAM once)
+       Example — full train manifest @ 5000 rows per slice, TF CPU backend:
+         python -m birdclef_a2.cli_embed --manifest train.csv --data-root DATA --birdnet-force-tf-cpu \
+           --chunk-rows 5000 --out-npz embeddings/train.npz --audio-relative-to train_audio
+       Manual shards + cli_merge_embeddings_npz still supported if you want control over filenames or resume semantics.
+   Faster local CPU embedding (PowerShell prelude; tune thread counts):
+     $env:BIRDCLEF_TF_NO_THREAD_CAPS = "1"
+     $env:TF_NUM_INTRA_OP_THREADS  = "22"
+     $env:TF_NUM_INTEROP_THREADS    = "6"
+     BirdNET pipeline workers (defaults n_workers=1 for rental safety; raise on home PC):
+       $env:BIRDCLEF_EMBED_N_WORKERS = "8"        # or "auto" (~physical cores, like official GUI)
+       $env:BIRDCLEF_EMBED_N_PRODUCERS = "2"
+       $env:BIRDCLEF_EMBED_PREFETCH_RATIO = "2"
+     Or CLI: ``--embed-n-workers 8 --embed-n-producers 2 --embed-prefetch-ratio 2``
+     (Also try ``--embed-batch-segments`` 24–32 if RAM allows.)
+     STDERR noise: ``cli_embed`` sets ``TF_CPP_MIN_LOG_LEVEL=3`` at import (before TF loads). Restore chatter with
+       ``--verbose-tf-logging``. If oneDNN lines still appear, set ``TF_ENABLE_ONEDNN_OPTS=0`` (may affect speed/numerics).
+     ``overlap-s`` almost equal to ``segment-s`` ⇒ many hops ⇒ slower CPU; smaller overlap ⇒ faster run, different pooled stats.
+     Put DATA on SSD; pause heavy antivirus realtime scan on DATA if decode sticks with idle CPU.
    Troubleshooting (GPU protobuf path):
      "No DNN support for stream" @ FusedBatchNormV3 = TensorFlow lacks working cuDNN for your driver/CUDA.
      Fix NVIDIA stack (driver + CUDA-matched tensorflow, e.g. pip install 'birdnet[and-cuda]') or force CPU flags above.
-     pthread_create / "can't start new thread" / worker failures = container thread or PID cgroup too tight; defaults now use
-       n_workers=1, n_producers=1 in encode_arrays, and TF_NUM_INTEROP/INTRA_OP threads capped unless BIRDCLEF_TF_NO_THREAD_CAPS=1.
+     pthread_create / "can't start new thread" / worker failures = container thread or PID cgroup too tight; defaults use
+       BIRDCLEF_EMBED_N_WORKERS=1 unless you raise it; also TF thread caps unless BIRDCLEF_TF_NO_THREAD_CAPS=1.
      If BirdNET asserts len(physical_devices)==1 when multiple GPUs are visible on host: export CUDA_VISIBLE_DEVICES=0
        (otherwise we set it by default only when unset).
      cli_embed merges all segment windows **per audio file into one BirdNET encode session** by default so tiny cgroups don't

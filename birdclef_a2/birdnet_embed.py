@@ -158,6 +158,54 @@ def _embed_segment_inputs_chunk_cap() -> int:
     return 999_999
 
 
+def _parse_embed_parallel_int(name: str, default: str) -> int:
+    raw = os.environ.get(name, default).strip()
+    if not raw.isdigit() or int(raw) < 1:
+        raise ValueError(f"{name} must be a positive integer (got {raw!r})")
+    return int(raw)
+
+
+def embed_encode_n_workers() -> int | None:
+    """BirdNET ``encode_arrays`` worker count.
+
+    Default ``1`` (safe on low ``ulimit`` hosts). Set ``auto`` to use birdnet default
+    (~physical CPU cores). Any positive integer is passed through.
+    """
+    raw = os.environ.get("BIRDCLEF_EMBED_N_WORKERS", "1").strip().lower()
+    if raw in ("auto", "default"):
+        return None
+    if raw.isdigit() and int(raw) >= 1:
+        return int(raw)
+    raise ValueError(
+        "BIRDCLEF_EMBED_N_WORKERS must be a positive integer or 'auto' "
+        f"(got {raw!r})"
+    )
+
+
+def embed_encode_n_producers() -> int:
+    return _parse_embed_parallel_int("BIRDCLEF_EMBED_N_PRODUCERS", "1")
+
+
+def embed_encode_prefetch_ratio() -> int:
+    return _parse_embed_parallel_int("BIRDCLEF_EMBED_PREFETCH_RATIO", "1")
+
+
+def log_embed_parallel_settings_once() -> None:
+    """Log BirdNET pipeline parallelism once per process."""
+    if getattr(log_embed_parallel_settings_once, "_done", False):
+        return
+    nw = embed_encode_n_workers()
+    logger.info(
+        "BirdNET encode_arrays parallelism: n_workers=%s n_producers=%s prefetch_ratio=%s "
+        "(env BIRDCLEF_EMBED_N_WORKERS=%r; use 'auto' for birdnet physical-core default)",
+        nw if nw is not None else "auto",
+        embed_encode_n_producers(),
+        embed_encode_prefetch_ratio(),
+        os.environ.get("BIRDCLEF_EMBED_N_WORKERS", "1"),
+    )
+    log_embed_parallel_settings_once._done = True  # type: ignore[attr-defined]
+
+
 def compute_file_embedding(
     audio_path: Path,
     *,
@@ -168,11 +216,20 @@ def compute_file_embedding(
 ) -> np.ndarray | None:
     model = acoustic_birdnet_model()
 
+    logger.debug("embedding: decode start %s", audio_path)
+
     try:
         wav = load_audio_mono(audio_path, sample_rate=sample_rate)
     except Exception as exc:  # pragma: no cover
         logger.warning("failed to load %s: %s", audio_path, exc)
         return None
+
+    logger.info(
+        "embedding: decoded %s -> %s samples @ %s Hz (BirdNET inference next)",
+        audio_path.name,
+        len(wav),
+        sample_rate,
+    )
 
     segments = iter_segments(
         wav, sample_rate=sample_rate, segment_s=segment_s, overlap_s=overlap_s
@@ -183,17 +240,34 @@ def compute_file_embedding(
     sess_dev = birdnet_session_device()
     # One BirdNET encode session per chunk — NOT per segment-batch (would fork workers endlessly).
     inputs_all = [(np.asarray(seg, dtype=np.float32), sample_rate) for seg in segments]
+    logger.info(
+        "embedding: %s BirdNET encode — %s segment(s), batch≤%s (first call can be slow on CPU)",
+        audio_path.name,
+        len(inputs_all),
+        embed_batch_segments,
+    )
     cap = _embed_segment_inputs_chunk_cap()
     pooled: list[np.ndarray] = []
+    n_workers = embed_encode_n_workers()
+    n_producers = embed_encode_n_producers()
+    prefetch_ratio = embed_encode_prefetch_ratio()
+    log_embed_parallel_settings_once()
 
     for c0 in range(0, len(inputs_all), cap):
         chunk = inputs_all[c0 : c0 + cap]
+        if c0 == 0 and len(inputs_all) > cap:
+            logger.info(
+                "embedding: %s encoding segment batch 0-%s/%s …",
+                audio_path.name,
+                min(len(chunk), len(inputs_all)),
+                len(inputs_all),
+            )
         res = model.encode_arrays(
             chunk,
-            n_producers=1,
-            n_workers=1,
+            n_producers=n_producers,
+            n_workers=n_workers,
             batch_size=min(len(chunk), embed_batch_segments),
-            prefetch_ratio=1,
+            prefetch_ratio=prefetch_ratio,
             overlap_duration_s=0.0,
             half_precision=False,
             show_stats=None,
@@ -218,13 +292,24 @@ def manifest_to_embeddings_npz(
     segment_s: float = 3.0,
     overlap_s: float = 1.5,
     embed_batch_segments: int = 16,
+    offset_rows: int = 0,
     limit_rows: int | None = None,
     audio_relative_to: str = "train_audio",
+    manifest_df: pd.DataFrame | None = None,
 ) -> None:
-    df = pd.read_csv(manifest_csv)
+    df = manifest_df if manifest_df is not None else pd.read_csv(manifest_csv)
     assert_manifest_columns(df)
     if label_col not in df.columns:
         raise KeyError(f"missing {label_col}")
+
+    n_manifest = len(df)
+    start = int(offset_rows)
+    if start < 0:
+        raise ValueError("offset_rows must be >= 0")
+    if start >= n_manifest:
+        raise ValueError(f"offset_rows={start} >= manifest rows ({n_manifest})")
+    stop = n_manifest if limit_rows is None else min(n_manifest, start + int(limit_rows))
+    sub = df.iloc[start:stop]
 
     bk, sess = birdnet_backend_and_session_device()
     logger.info(
@@ -233,16 +318,37 @@ def manifest_to_embeddings_npz(
         sess,
         birdnet_inference_device(),
     )
+    logger.info(
+        "manifest slice: rows [%s:%s] (%s rows of %s total)",
+        start,
+        stop,
+        len(sub),
+        n_manifest,
+    )
 
     sr = birdnet_sample_rate()
     xs: list[np.ndarray] = []
     ys: list[str] = []
     paths_ok: list[str] = []
 
-    n = len(df) if limit_rows is None else min(len(df), limit_rows)
-    for i in range(n):
-        row = df.iloc[i]
+    n_chunk = len(sub)
+    for i in range(n_chunk):
+        row = sub.iloc[i]
         rel = str(row["filename"])
+        # Heartbeat before slow BirdNET/audio work: previously we only logged every 50 *successful*
+        # embeddings, so CPU-first-file could run for hours with no INFO at all.
+        if i == 0 or (i + 1) % 50 == 0:
+            logger.info(
+                "manifest progress: slice row %s / %s (csv row ~ %s / %s), embeddings_ok=%s, "
+                "next_file=%s",
+                i + 1,
+                n_chunk,
+                start + i + 1,
+                n_manifest,
+                len(xs),
+                rel,
+            )
+
         ap = resolve_audio_path(data_root, rel, relative_to=audio_relative_to)
         if not ap.is_file():
             logger.warning("missing audio (skipped): %s", ap)
@@ -259,8 +365,6 @@ def manifest_to_embeddings_npz(
         xs.append(emb)
         ys.append(str(row[label_col]))
         paths_ok.append(rel)
-        if (i + 1) % 50 == 0:
-            logger.info("embedded %s / %s rows", i + 1, n)
 
     if not xs:
         raise RuntimeError("no embeddings produced (check paths and audio files)")

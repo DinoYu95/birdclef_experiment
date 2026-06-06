@@ -203,6 +203,24 @@ def train_torch_classifier(
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    n_train = len(ds_tr)
+    n_val = len(ds_va)
+    steps_per_epoch = (n_train + batch_size - 1) // batch_size
+    logger.info(
+        "TinyMelCNN: device=%s train=%s val=%s classes=%s batch_size=%s steps/epoch≈%s",
+        device,
+        n_train,
+        n_val,
+        n_classes,
+        batch_size,
+        steps_per_epoch,
+    )
+    if device.type == "cpu":
+        logger.warning(
+            "Training on CPU — first epoch can take a long time before any log; "
+            "install torch+cu124 and re-run for GPU."
+        )
+
     model = TinyMelCNN(n_classes=n_classes).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     crit = nn.CrossEntropyLoss()
@@ -213,7 +231,7 @@ def train_torch_classifier(
     for epoch in range(epochs):
         model.train()
         losses = []
-        for xb, yb in dl_tr:
+        for step, (xb, yb) in enumerate(dl_tr, start=1):
             xb = xb.to(device)
             yb = yb.to(device)
             opt.zero_grad(set_to_none=True)
@@ -222,7 +240,16 @@ def train_torch_classifier(
             loss.backward()
             opt.step()
             losses.append(loss.item())
+            if step == 1 or step % 100 == 0 or step == steps_per_epoch:
+                logger.info(
+                    "epoch %s train batch %s/%s loss=%.4f",
+                    epoch + 1,
+                    step,
+                    steps_per_epoch,
+                    losses[-1],
+                )
 
+        logger.info("epoch %s running validation (%s samples)…", epoch + 1, n_val)
         va_acc, _ = evaluate_loader(model, dl_va, device)
         logger.info(
             "epoch %s train_loss=%.4f val_acc=%.4f",
