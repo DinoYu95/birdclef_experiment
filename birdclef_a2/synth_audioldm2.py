@@ -72,8 +72,74 @@ def compute_training_deficits(
     return deficits
 
 
+def _existing_synth_counts(
+    existing_manifest: Path | None,
+    label_col: str,
+) -> dict[str, int]:
+    if existing_manifest is None or not existing_manifest.is_file():
+        return {}
+    df = pd.read_csv(existing_manifest)
+    if label_col not in df.columns:
+        raise ValueError(f"{existing_manifest} missing column {label_col!r}")
+    return df[label_col].astype(str).value_counts().astype(int).to_dict()
+
+
+def compute_remaining_deficits(
+    *,
+    train_manifest: Path,
+    val_manifest: Path | None,
+    label_col: str,
+    target_per_class: int,
+    existing_manifest: Path | None = None,
+    start_label: str | None = None,
+    only_aves: bool = False,
+    primary_to_class: dict[str, str] | None = None,
+) -> dict[str, int]:
+    """Deficit slots still to fill, subtracting prior synthetic manifest rows."""
+    tr = pd.read_csv(train_manifest)
+    vc = tr[label_col].astype(str).value_counts()
+    labs = set(vc.index.astype(str))
+    if val_manifest is not None:
+        va = pd.read_csv(val_manifest)
+        labs |= set(va[label_col].astype(str))
+
+    existing = _existing_synth_counts(existing_manifest, label_col)
+    deficits: dict[str, int] = {}
+    for lab in sorted(labs):
+        if start_label is not None and lab < start_label:
+            continue
+        if only_aves:
+            cls_name = (primary_to_class or {}).get(lab, "")
+            if not _taxon_is_bird(cls_name):
+                continue
+        real_cnt = int(vc.get(lab, 0))
+        synth_cnt = int(existing.get(lab, 0))
+        need = int(target_per_class) - real_cnt - synth_cnt
+        if need > 0:
+            deficits[lab] = need
+    return deficits
+
+
 def _taxon_is_bird(class_name: str) -> bool:
     return class_name.strip().lower() == "aves"
+
+
+def _estimate_max_attempts(
+    items: list[tuple[str, int]],
+    verify_birdnet: bool,
+    verify_only_bird_classes: bool,
+    primary_to_class: dict[str, str],
+    verify_max_retries: int,
+) -> int:
+    total = 0
+    for lab, need in items:
+        cls_name = primary_to_class.get(lab, "")
+        run_verify = bool(verify_birdnet) and (
+            not verify_only_bird_classes or _taxon_is_bird(cls_name)
+        )
+        tries = verify_max_retries if run_verify else 1
+        total += need * tries
+    return total
 
 
 def _load_audioldm2_pipeline(hf_model_id: str, torch_dtype):
@@ -116,6 +182,9 @@ def generate_balanced_synthetic_manifest(
     verify_only_bird_classes: bool,
     dtype: str,
     limit_classes: int | None,
+    existing_manifest: Path | None,
+    start_label: str | None,
+    only_aves: bool,
     dry_run: bool,
 ) -> None:
     primary_to_common, primary_to_sci, primary_to_class = load_taxonomy_maps(taxonomy_csv)
@@ -127,12 +196,24 @@ def generate_balanced_synthetic_manifest(
     if max_target_cap is not None:
         tgt = min(tgt, int(max_target_cap))
 
-    deficits = compute_training_deficits(
-        train_manifest=train_manifest,
-        val_manifest=val_manifest,
-        label_col=label_col,
-        target_per_class=tgt,
-    )
+    if existing_manifest is not None or start_label is not None or only_aves:
+        deficits = compute_remaining_deficits(
+            train_manifest=train_manifest,
+            val_manifest=val_manifest,
+            label_col=label_col,
+            target_per_class=tgt,
+            existing_manifest=existing_manifest,
+            start_label=start_label,
+            only_aves=only_aves,
+            primary_to_class=primary_to_class,
+        )
+    else:
+        deficits = compute_training_deficits(
+            train_manifest=train_manifest,
+            val_manifest=val_manifest,
+            label_col=label_col,
+            target_per_class=tgt,
+        )
     items = sorted(deficits.items(), key=lambda x: x[0])
     if limit_classes is not None:
         items = items[: int(limit_classes)]
@@ -141,9 +222,25 @@ def generate_balanced_synthetic_manifest(
     rows: list[dict[str, str]] = []
 
     total_new = sum(n for _, n in items)
+    existing = _existing_synth_counts(existing_manifest, label_col)
 
     if dry_run:
-        print(f"Would synthesize ~ {total_new} clips across {len(items)} labels.")
+        print(
+            f"target_per_class={tgt} labels_to_run={len(items)} "
+            f"slots_to_try={total_new} max_attempts~={_estimate_max_attempts(items, verify_birdnet, verify_only_bird_classes, primary_to_class, verify_max_retries)}"
+        )
+        if existing_manifest is not None:
+            print(f"existing_manifest={existing_manifest} prior_rows={sum(existing.values())}")
+        if start_label is not None:
+            print(f"start_label={start_label!r} (skip alphabetically earlier)")
+        if only_aves:
+            print("only_aves=True (non-bird taxa skipped)")
+        for lab, need in items[:15]:
+            real = int(vc.get(lab, 0))
+            prior = int(existing.get(lab, 0))
+            print(f"  {lab}: real_train={real} prior_synth={prior} slots={need}")
+        if len(items) > 15:
+            print(f"  ... and {len(items) - 15} more labels")
         return
 
     try:
@@ -175,6 +272,16 @@ def generate_balanced_synthetic_manifest(
 
     import soundfile as sf
 
+    logger.info(
+        "Resume plan: target=%s labels=%s slots=%s existing_manifest=%s start_label=%s only_aves=%s",
+        tgt,
+        len(items),
+        total_new,
+        existing_manifest,
+        start_label,
+        only_aves,
+    )
+
     done = 0
     n_rejected = 0
     for lab, need in items:
@@ -198,53 +305,63 @@ def generate_balanced_synthetic_manifest(
             )
 
         produced = 0
-        attempt_budget = need * verify_max_retries if run_birdnet_verify else need
         attempts = 0
+        tries_per_slot = verify_max_retries if run_birdnet_verify else 1
 
-        while produced < need and attempts < attempt_budget:
-            attempts += 1
-            fname = f"{uuid.uuid4().hex}.wav"
-            out_wav = subdir / fname
+        # One "slot" = one deficit clip. Up to tries_per_slot generations per slot;
+        # if all tries fail, move on. Never spend more than need * tries_per_slot
+        # attempts on a single label (avoids infinite retry on hard taxa).
+        for _slot in range(need):
+            for _try in range(tries_per_slot):
+                attempts += 1
+                fname = f"{uuid.uuid4().hex}.wav"
+                out_wav = subdir / fname
 
-            out = pipe(
-                prompt,
-                audio_length_in_s=float(audio_seconds),
-                num_inference_steps=int(inference_steps),
-            )
-            audio = np.asarray(out.audios[0], dtype=np.float32)
-
-            sf.write(out_wav, audio, sr)
-
-            if run_birdnet_verify:
-                ok = synthetic_passes_birdnet_classifier(
-                    out_wav,
-                    scientific_name=sci_n,
-                    common_name=com_n,
-                    top_k=verify_top_k,
-                    run_min_confidence=verify_run_min_confidence,
-                    row_min_confidence=verify_row_min_confidence,
+                out = pipe(
+                    prompt,
+                    audio_length_in_s=float(audio_seconds),
+                    num_inference_steps=int(inference_steps),
                 )
-                if not ok:
-                    n_rejected += 1
-                    try:
-                        out_wav.unlink()
-                    except OSError:
-                        pass
-                    continue
+                audio = np.asarray(out.audios[0], dtype=np.float32)
 
-            rel_path = Path(out_wav).resolve().relative_to(Path(data_root).resolve())
-            rows.append({"filename": rel_path.as_posix(), label_col: lab})
-            produced += 1
-            done += 1
-            if done % 10 == 0:
-                logger.info("synthetic accepted %s / ~%s total", done, total_new)
+                sf.write(out_wav, audio, sr)
+
+                if run_birdnet_verify:
+                    ok = synthetic_passes_birdnet_classifier(
+                        out_wav,
+                        scientific_name=sci_n,
+                        common_name=com_n,
+                        top_k=verify_top_k,
+                        run_min_confidence=verify_run_min_confidence,
+                        row_min_confidence=verify_row_min_confidence,
+                    )
+                    if not ok:
+                        n_rejected += 1
+                        try:
+                            out_wav.unlink()
+                        except OSError:
+                            pass
+                        continue
+
+                rel_path = Path(out_wav).resolve().relative_to(
+                    Path(data_root).resolve()
+                )
+                rows.append({"filename": rel_path.as_posix(), label_col: lab})
+                produced += 1
+                done += 1
+                if done % 10 == 0:
+                    logger.info("synthetic accepted %s / ~%s total", done, total_new)
+                break
 
         if produced < need:
             logger.warning(
-                "label %s: only %s/%s accepted after %s attempts (verify=%s)",
+                "label %s: filled %s/%s slots (%s slots exhausted all %s tries; "
+                "total_attempts=%s verify=%s)",
                 lab,
                 produced,
                 need,
+                need - produced,
+                tries_per_slot,
                 attempts,
                 verify_birdnet,
             )

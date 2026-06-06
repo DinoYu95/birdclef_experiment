@@ -77,11 +77,37 @@ def main() -> None:
     p.add_argument(
         "--verify-max-retries",
         type=int,
-        default=25,
-        help="Max generation attempts per label = need * this value when verify is on.",
+        default=10,
+        help=(
+            "When --verify-birdnet: max generation attempts per deficit slot "
+            "(need slots per label; failed slot moves on). Default 10. "
+            "Without verify: one generation per slot."
+        ),
     )
     p.add_argument("--dtype", choices=("fp16", "fp32"), default="fp16")
     p.add_argument("--limit-classes", type=int, default=None)
+    p.add_argument(
+        "--existing-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Prior synthetic.manifest.csv; per-label slot counts are subtracted "
+            "so completed classes are skipped."
+        ),
+    )
+    p.add_argument(
+        "--start-label",
+        default=None,
+        help=(
+            "Only process labels >= this primary_label (alphabetical). "
+            "Use ashgre1 to continue the bird queue without touching earlier taxa."
+        ),
+    )
+    p.add_argument(
+        "--only-aves",
+        action="store_true",
+        help="Only synthesize taxa with class_name=Aves (skip frog/mammal/etc.).",
+    )
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
@@ -114,9 +140,14 @@ def main() -> None:
         verify_only_bird_classes=not args.verify_include_non_aves,
         dtype=args.dtype,
         limit_classes=args.limit_classes,
+        existing_manifest=args.existing_manifest,
+        start_label=args.start_label,
+        only_aves=args.only_aves,
         dry_run=args.dry_run,
     )
-    synth_cfg_path = Path(args.out_manifest).parent / "synthetic_experiment_config.json"
+    synth_cfg_path = args.out_manifest.with_name(
+        f"{args.out_manifest.stem}_experiment_config.json"
+    )
     write_json(
         synth_cfg_path,
         {
