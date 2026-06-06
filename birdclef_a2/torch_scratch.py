@@ -8,7 +8,9 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torchaudio
+from sklearn.metrics import f1_score
 from torch.utils.data import DataLoader, Dataset
+from torchvision.models import resnet18
 
 from birdclef_a2.audio_io import load_audio_mono
 from birdclef_a2.manifest_utils import assert_manifest_columns, resolve_audio_path
@@ -111,6 +113,44 @@ class TinyMelCNN(nn.Module):
         return self.net(x)
 
 
+class ResNet18Mel(nn.Module):
+    """ResNet-18 on single-channel Mel spectrograms (random init, from scratch)."""
+
+    def __init__(self, n_classes: int) -> None:
+        super().__init__()
+        backbone = resnet18(weights=None)
+        backbone.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        backbone.fc = nn.Linear(backbone.fc.in_features, n_classes)
+        self.net = backbone
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def build_model(arch: str, n_classes: int) -> nn.Module:
+    key = arch.strip().lower()
+    if key in ("tinymel", "tiny", "tinymelcnn"):
+        return TinyMelCNN(n_classes)
+    if key in ("resnet18", "resnet"):
+        return ResNet18Mel(n_classes)
+    raise ValueError(f"unknown --arch {arch!r}; choose tinymel or resnet18")
+
+
+def class_weights_from_manifest(
+    manifest_csv: Path,
+    *,
+    label_col: str,
+    label_to_idx: dict[str, int],
+    n_classes: int,
+) -> torch.Tensor:
+    df = pd.read_csv(manifest_csv)
+    counts = np.zeros(n_classes, dtype=np.float64)
+    for lab in df[label_col].astype(str):
+        counts[label_to_idx[lab]] += 1.0
+    weights = counts.sum() / (n_classes * np.maximum(counts, 1.0))
+    return torch.tensor(weights, dtype=torch.float32)
+
+
 def fit_label_mapping(
     train_manifest: Path,
     val_manifest: Path,
@@ -127,19 +167,31 @@ def fit_label_mapping(
 
 
 @torch.no_grad()
-def evaluate_loader(model: nn.Module, loader: DataLoader, device: torch.device) -> tuple[float, float]:
+def evaluate_loader(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    use_amp: bool,
+) -> tuple[float, float, list[int], list[int]]:
     model.eval()
     correct = 0
     total = 0
+    ys: list[int] = []
+    ps: list[int] = []
+    amp_device = "cuda" if device.type == "cuda" else "cpu"
     for xb, yb in loader:
-        xb = xb.to(device)
-        yb = yb.to(device)
-        logits = model(xb)
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True)
+        with torch.amp.autocast(amp_device, enabled=use_amp):
+            logits = model(xb)
         pred = logits.argmax(dim=-1)
         correct += int((pred == yb).sum().item())
         total += int(yb.numel())
+        ys.extend(yb.cpu().numpy().tolist())
+        ps.extend(pred.cpu().numpy().tolist())
     acc = correct / max(total, 1)
-    return acc, correct
+    return acc, correct, ys, ps
 
 
 def train_torch_classifier(
@@ -155,9 +207,12 @@ def train_torch_classifier(
     lr: float,
     seed: int,
     num_workers: int,
+    arch: str = "resnet18",
+    use_amp: bool = True,
 ) -> None:
     torch.manual_seed(seed)
     out_dir.mkdir(parents=True, exist_ok=True)
+    arch_key = arch.strip().lower()
 
     classes, label_to_idx = fit_label_mapping(train_manifest, val_manifest, label_col)
     n_classes = len(classes)
@@ -203,12 +258,16 @@ def train_torch_classifier(
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    amp_on = use_amp and device.type == "cuda"
+    amp_device = "cuda" if device.type == "cuda" else "cpu"
     n_train = len(ds_tr)
     n_val = len(ds_va)
     steps_per_epoch = (n_train + batch_size - 1) // batch_size
     logger.info(
-        "TinyMelCNN: device=%s train=%s val=%s classes=%s batch_size=%s steps/epoch≈%s",
+        "%s: device=%s amp=%s train=%s val=%s classes=%s batch_size=%s steps/epoch≈%s",
+        arch_key,
         device,
+        amp_on,
         n_train,
         n_val,
         n_classes,
@@ -221,24 +280,34 @@ def train_torch_classifier(
             "install torch+cu124 and re-run for GPU."
         )
 
-    model = TinyMelCNN(n_classes=n_classes).to(device)
+    model = build_model(arch_key, n_classes=n_classes).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    crit = nn.CrossEntropyLoss()
+    class_w = class_weights_from_manifest(
+        train_manifest,
+        label_col=label_col,
+        label_to_idx=label_to_idx,
+        n_classes=n_classes,
+    ).to(device)
+    crit = nn.CrossEntropyLoss(weight=class_w)
+    scaler = torch.amp.GradScaler(amp_device, enabled=amp_on)
 
+    best_f1 = -1.0
     best_acc = -1.0
-    best_path = out_dir / "melcnn_best.pt"
+    best_path = out_dir / f"{arch_key}_best.pt"
 
     for epoch in range(epochs):
         model.train()
         losses = []
         for step, (xb, yb) in enumerate(dl_tr, start=1):
-            xb = xb.to(device)
-            yb = yb.to(device)
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
-            logits = model(xb)
-            loss = crit(logits, yb)
-            loss.backward()
-            opt.step()
+            with torch.amp.autocast(amp_device, enabled=amp_on):
+                logits = model(xb)
+                loss = crit(logits, yb)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
             losses.append(loss.item())
             if step == 1 or step % 100 == 0 or step == steps_per_epoch:
                 logger.info(
@@ -250,21 +319,35 @@ def train_torch_classifier(
                 )
 
         logger.info("epoch %s running validation (%s samples)…", epoch + 1, n_val)
-        va_acc, _ = evaluate_loader(model, dl_va, device)
+        va_acc, _, ys_ep, ps_ep = evaluate_loader(
+            model, dl_va, device, use_amp=amp_on
+        )
+        va_f1 = float(
+            f1_score(ys_ep, ps_ep, average="macro", zero_division=0)
+        )
         logger.info(
-            "epoch %s train_loss=%.4f val_acc=%.4f",
+            "epoch %s train_loss=%.4f val_acc=%.4f val_macro_f1=%.4f",
             epoch + 1,
             float(np.mean(losses)) if losses else 0.0,
             va_acc,
+            va_f1,
         )
-        if va_acc > best_acc:
+        if va_f1 > best_f1:
+            best_f1 = va_f1
             best_acc = va_acc
             torch.save(
-                {"model": model.state_dict(), "classes": classes, "label_col": label_col},
+                {
+                    "model": model.state_dict(),
+                    "classes": classes,
+                    "label_col": label_col,
+                    "arch": arch_key,
+                },
                 best_path,
             )
 
-    print(f"Best val acc ~ {best_acc:.4f}; checkpoint: {best_path}")
+    print(
+        f"Best val macro_f1 ~ {best_f1:.4f} (acc {best_acc:.4f}); checkpoint: {best_path}"
+    )
 
     try:
         ckpt = torch.load(best_path, map_location=device, weights_only=False)
@@ -292,6 +375,8 @@ def train_torch_classifier(
     report = classification_report_txt(y_names, p_names)
     metrics = scalar_metrics(y_names, p_names)
     metrics["best_epoch_val_accuracy"] = float(best_acc)
+    metrics["best_epoch_val_macro_f1"] = float(best_f1)
+    metrics["arch"] = arch_key
 
     (out_dir / "val_classification_report.txt").write_text(report, encoding="utf-8")
     write_json(out_dir / "val_metrics.json", metrics)

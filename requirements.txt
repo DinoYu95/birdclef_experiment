@@ -19,9 +19,10 @@ soundfile>=0.12,<0.15
 # GPU issues (e.g. FusedBatchNorm / "No DNN support for stream"): unset GPU or BIRDCLEF_BIRDNET_FORCE_TF_CPU=1.
 birdnet>=0.2.5,<1
 
-# Scratch mel-CNN training
+# Scratch mel-CNN / ResNet18 training
 torch>=2.2,<3
 torchaudio>=2.2,<3
+torchvision>=0.17,<1
 
 # Part B synthetic audio (AudioLDM2 / "AudioLM2" in briefs)
 diffusers>=0.27,<1

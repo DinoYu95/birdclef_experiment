@@ -1,4 +1,4 @@
-"""CLI: train tiny mel-CNN from scratch on competition manifests."""
+"""CLI: train mel-spectrogram classifier from scratch (ResNet18 or TinyMelCNN)."""
 from __future__ import annotations
 
 import argparse
@@ -22,11 +22,22 @@ def main() -> None:
         choices=("train_audio", "data_root"),
         default="train_audio",
     )
-    p.add_argument("--epochs", type=int, default=15)
-    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument(
+        "--arch",
+        choices=("resnet18", "tinymel"),
+        default="resnet18",
+        help="resnet18 = deeper CNN on Mel (default); tinymel = legacy 2-layer baseline",
+    )
+    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument(
+        "--no-amp",
+        action="store_true",
+        help="Disable CUDA automatic mixed precision",
+    )
     p.add_argument("--out-dir", type=Path, default=Path("outputs/torch_scratch"))
     args = p.parse_args()
 
@@ -43,6 +54,8 @@ def main() -> None:
         lr=args.lr,
         seed=args.seed,
         num_workers=args.num_workers,
+        arch=args.arch,
+        use_amp=not args.no_amp,
     )
     write_json(
         args.out_dir / "experiment_config.json",
