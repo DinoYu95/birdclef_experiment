@@ -1,0 +1,21 @@
+{
+  "data_root": "D:\\COMPX525-DL\\assignment2\\data",
+  "train_csv": "D:\\COMPX525-DL\\assignment2\\data\\train.csv",
+  "n_total": 35549,
+  "n_train": 28436,
+  "n_val": 7113,
+  "val_fraction_requested": 0.2,
+  "fraction_val_actual": 0.20009,
+  "n_singleton_labels": 4,
+  "n_singleton_rows": 4,
+  "n_classes_total": 206,
+  "seed": 42,
+  "cli_args": {
+    "data_root": "..\\data",
+    "out_dir": "outputs\\splits",
+    "label_col": "primary_label",
+    "group_col": null,
+    "val_fraction": 0.2,
+    "seed": 42
+  }
+}
