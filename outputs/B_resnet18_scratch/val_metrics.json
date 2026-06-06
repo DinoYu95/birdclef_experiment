@@ -1,0 +1,10 @@
+{
+  "macro_f1": 0.4964261338778046,
+  "weighted_f1": 0.5677338824092856,
+  "balanced_accuracy": 0.5037673895939279,
+  "accuracy": 0.5610853367074371,
+  "cohen_kappa": 0.5574274550801079,
+  "best_epoch_val_accuracy": 0.5612259243638409,
+  "best_epoch_val_macro_f1": 0.49657950866981854,
+  "arch": "resnet18"
+}
