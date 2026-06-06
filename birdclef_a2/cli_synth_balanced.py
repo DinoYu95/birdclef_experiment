@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from pathlib import Path
 
+from birdclef_a2.birdnet_verify_synth import DEFAULT_NEGATIVE_PROMPT
 from birdclef_a2.config import load_layout
 from birdclef_a2.report_exports import write_json
 from birdclef_a2.synth_audioldm2 import generate_balanced_synthetic_manifest
@@ -43,15 +45,48 @@ def main() -> None:
         help="Clamp target per class after computing from max-count (VRAM/time control).",
     )
     p.add_argument("--audio-seconds", type=float, default=5.0)
-    p.add_argument("--inference-steps", type=int, default=50)
+    p.add_argument("--inference-steps", type=int, default=100)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--negative-prompt",
+        default=DEFAULT_NEGATIVE_PROMPT,
+        help="AudioLDM2 negative prompt (discourage low-quality / non-bird artefacts).",
+    )
     p.add_argument(
         "--verify-birdnet",
         action="store_true",
+        help="After each wav: run BirdNET verification (see --verify-mode).",
+    )
+    p.add_argument(
+        "--verify-mode",
+        choices=("embed", "species", "both", "either"),
+        default="embed",
         help=(
-            "After each wav: run BirdNET classifier (species names, not embeddings) "
-            "and keep only clips whose predictions match taxonomy (see verify-only-bird-classes)."
+            "embed=cosine vs real-train centroid (default, higher pass rate); "
+            "species=top-k name match; both/either=combine modes."
         ),
+    )
+    p.add_argument(
+        "--verify-embed-min-cosine",
+        type=float,
+        default=0.55,
+        help="Min cosine similarity for embed verify mode.",
+    )
+    p.add_argument(
+        "--verify-centroid-max-samples",
+        type=int,
+        default=8,
+        help="Real train clips per label when building BirdNET embedding centroids.",
+    )
+    p.add_argument(
+        "--birdnet-device",
+        default=None,
+        help="BirdNET device for verify: CPU, GPU:0, etc. (env BIRDCLEF_BIRDNET_DEVICE).",
+    )
+    p.add_argument(
+        "--birdnet-force-tf-cpu",
+        action="store_true",
+        help="Force BirdNET TF-lite CPU path even when --birdnet-device requests GPU.",
     )
     p.add_argument(
         "--verify-include-non-aves",
@@ -111,6 +146,11 @@ def main() -> None:
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
+    if args.birdnet_device is not None:
+        os.environ["BIRDCLEF_BIRDNET_DEVICE"] = args.birdnet_device
+    if args.birdnet_force_tf_cpu:
+        os.environ["BIRDCLEF_BIRDNET_FORCE_TF_CPU"] = "1"
+
     layout = load_layout(args.data_root)
     tax = args.taxonomy_csv or (layout.root / "taxonomy.csv")
     if not tax.is_file():
@@ -137,7 +177,11 @@ def main() -> None:
         verify_run_min_confidence=args.verify_run_min_confidence,
         verify_row_min_confidence=args.verify_row_min_confidence,
         verify_max_retries=args.verify_max_retries,
+        verify_mode=args.verify_mode,
+        verify_embed_min_cosine=args.verify_embed_min_cosine,
+        verify_centroid_max_samples=args.verify_centroid_max_samples,
         verify_only_bird_classes=not args.verify_include_non_aves,
+        negative_prompt=args.negative_prompt,
         dtype=args.dtype,
         limit_classes=args.limit_classes,
         existing_manifest=args.existing_manifest,

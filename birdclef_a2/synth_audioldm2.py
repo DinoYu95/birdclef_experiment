@@ -6,6 +6,7 @@ AudioLDM2 checkpoints from Hugging Face `cvssp/audioldm2*`.
 """
 from __future__ import annotations
 
+import ast
 import logging
 import uuid
 from pathlib import Path
@@ -13,9 +14,61 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from birdclef_a2.birdnet_verify_synth import synthetic_passes_birdnet_classifier
+from birdclef_a2.birdnet_verify_synth import (
+    DEFAULT_NEGATIVE_PROMPT,
+    TrainLabelCentroidCache,
+    synthetic_passes_birdnet_verify,
+)
 
 logger = logging.getLogger(__name__)
+
+_PROMPT_TEMPLATES_AVES = (
+    "clear close-up {vocal} of {common}, {sci}, single bird, tropical forest, "
+    "high quality mono field recording",
+    "xeno-canto style {vocal} of {common}, {sci}, one individual bird, natural habitat",
+    "recording of {common} {vocal}, {sci}, crisp bird sound, outdoor ambience",
+)
+_PROMPT_TEMPLATES_OTHER = (
+    "high quality mono field recording of {common} vocalization, {sci}, natural habitat",
+    "clear wildlife sound of {common}, {sci}, single animal, outdoor recording",
+)
+
+
+def _parse_vocalization_type(raw: object) -> str | None:
+    if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+        return None
+    text = str(raw).strip()
+    if not text or text.lower() in ("nan", "[]"):
+        return None
+    try:
+        parsed = ast.literal_eval(text)
+        if isinstance(parsed, list) and parsed:
+            return str(parsed[0]).strip().lower()
+    except (SyntaxError, ValueError):
+        pass
+    return text.strip().lower()
+
+
+def vocalization_hints_for_label(
+    train_manifest: Path,
+    *,
+    label_col: str,
+    primary_label: str,
+) -> list[str]:
+    """Sample vocalization tokens (song/call/...) from real train rows for prompts."""
+    df = pd.read_csv(train_manifest)
+    if label_col not in df.columns:
+        return ["bird song"]
+    sub = df[df[label_col].astype(str) == str(primary_label)]
+    hints: list[str] = []
+    if "type" in sub.columns:
+        for raw in sub["type"].dropna().head(12):
+            tok = _parse_vocalization_type(raw)
+            if tok and tok not in hints:
+                hints.append(tok)
+    if not hints:
+        hints = ["bird song", "bird call"]
+    return hints
 
 
 def prompt_for_taxon(
@@ -23,17 +76,21 @@ def prompt_for_taxon(
     *,
     primary_to_common: dict[str, str],
     primary_to_sci: dict[str, str],
+    class_name: str = "",
+    vocalization: str | None = None,
+    rng: np.random.Generator | None = None,
 ) -> str:
     cn = primary_to_common.get(primary_label, "wildlife sound")
     sn = primary_to_sci.get(primary_label, "")
-    bits = [
-        "high quality mono field recording",
-        f"animal vocalization of {cn}",
-    ]
-    if sn:
-        bits.append(sn)
-    bits.append("natural ambient noise, no music")
-    return ", ".join(bits)
+    is_bird = _taxon_is_bird(class_name)
+    vocal = (vocalization or ("bird song" if is_bird else "vocalization")).strip().lower()
+    if is_bird and not vocal.startswith("bird"):
+        vocal = f"bird {vocal}"
+
+    templates = _PROMPT_TEMPLATES_AVES if is_bird else _PROMPT_TEMPLATES_OTHER
+    pick = int(rng.integers(0, len(templates))) if rng is not None else 0
+    prompt = templates[pick].format(common=cn, sci=sn or cn, vocal=vocal)
+    return prompt
 
 
 def load_taxonomy_maps(
@@ -179,7 +236,11 @@ def generate_balanced_synthetic_manifest(
     verify_run_min_confidence: float,
     verify_row_min_confidence: float,
     verify_max_retries: int,
+    verify_mode: str,
+    verify_embed_min_cosine: float,
+    verify_centroid_max_samples: int,
     verify_only_bird_classes: bool,
+    negative_prompt: str,
     dtype: str,
     limit_classes: int | None,
     existing_manifest: Path | None,
@@ -252,6 +313,16 @@ def generate_balanced_synthetic_manifest(
 
     torch.manual_seed(seed)
     np.random.seed(seed)
+    rng = np.random.default_rng(seed)
+
+    centroid_cache: TrainLabelCentroidCache | None = None
+    if verify_birdnet and verify_mode.strip().lower() in ("embed", "both", "either"):
+        centroid_cache = TrainLabelCentroidCache(
+            train_manifest=train_manifest,
+            data_root=data_root,
+            label_col=label_col,
+            max_samples=verify_centroid_max_samples,
+        )
 
     torch_dtype = torch.float16 if dtype == "fp16" else torch.float32
     pipe = _load_audioldm2_pipeline(hf_model_id, torch_dtype)
@@ -284,16 +355,21 @@ def generate_balanced_synthetic_manifest(
 
     done = 0
     n_rejected = 0
+    vocal_hints_cache: dict[str, list[str]] = {}
+
     for lab, need in items:
         subdir = out_audio_dir / lab
         subdir.mkdir(parents=True, exist_ok=True)
-        prompt = prompt_for_taxon(
-            lab, primary_to_common=primary_to_common, primary_to_sci=primary_to_sci
-        )
 
         sci_n = primary_to_sci.get(lab, "")
         com_n = primary_to_common.get(lab, "")
         cls_name = primary_to_class.get(lab, "")
+        if lab not in vocal_hints_cache:
+            vocal_hints_cache[lab] = vocalization_hints_for_label(
+                train_manifest, label_col=label_col, primary_label=lab
+            )
+        vocal_hints = vocal_hints_cache[lab]
+        centroid = centroid_cache.get(lab) if centroid_cache is not None else None
         run_birdnet_verify = bool(verify_birdnet) and (
             not verify_only_bird_classes or _taxon_is_bird(cls_name)
         )
@@ -302,6 +378,15 @@ def generate_balanced_synthetic_manifest(
                 "BirdNET verify skipped for non-Aves taxon %s (class_name=%r)",
                 lab,
                 cls_name,
+            )
+        if (
+            run_birdnet_verify
+            and verify_mode.strip().lower() in ("embed", "both")
+            and centroid is None
+        ):
+            logger.warning(
+                "label %s: no train centroid for embed verify — slots will fail embed check",
+                lab,
             )
 
         produced = 0
@@ -312,28 +397,43 @@ def generate_balanced_synthetic_manifest(
         # if all tries fail, move on. Never spend more than need * tries_per_slot
         # attempts on a single label (avoids infinite retry on hard taxa).
         for _slot in range(need):
+            vocal = vocal_hints[int(rng.integers(0, len(vocal_hints)))]
+            prompt = prompt_for_taxon(
+                lab,
+                primary_to_common=primary_to_common,
+                primary_to_sci=primary_to_sci,
+                class_name=cls_name,
+                vocalization=vocal,
+                rng=rng,
+            )
             for _try in range(tries_per_slot):
                 attempts += 1
                 fname = f"{uuid.uuid4().hex}.wav"
                 out_wav = subdir / fname
 
-                out = pipe(
-                    prompt,
-                    audio_length_in_s=float(audio_seconds),
-                    num_inference_steps=int(inference_steps),
-                )
+                pipe_kwargs: dict = {
+                    "audio_length_in_s": float(audio_seconds),
+                    "num_inference_steps": int(inference_steps),
+                }
+                if negative_prompt.strip():
+                    pipe_kwargs["negative_prompt"] = negative_prompt
+
+                out = pipe(prompt, **pipe_kwargs)
                 audio = np.asarray(out.audios[0], dtype=np.float32)
 
                 sf.write(out_wav, audio, sr)
 
                 if run_birdnet_verify:
-                    ok = synthetic_passes_birdnet_classifier(
+                    ok = synthetic_passes_birdnet_verify(
                         out_wav,
+                        verify_mode=verify_mode,
                         scientific_name=sci_n,
                         common_name=com_n,
+                        centroid=centroid,
                         top_k=verify_top_k,
                         run_min_confidence=verify_run_min_confidence,
                         row_min_confidence=verify_row_min_confidence,
+                        embed_min_cosine=verify_embed_min_cosine,
                     )
                     if not ok:
                         n_rejected += 1
@@ -356,7 +456,7 @@ def generate_balanced_synthetic_manifest(
         if produced < need:
             logger.warning(
                 "label %s: filled %s/%s slots (%s slots exhausted all %s tries; "
-                "total_attempts=%s verify=%s)",
+                "total_attempts=%s verify=%s mode=%s)",
                 lab,
                 produced,
                 need,
@@ -364,6 +464,7 @@ def generate_balanced_synthetic_manifest(
                 tries_per_slot,
                 attempts,
                 verify_birdnet,
+                verify_mode,
             )
 
     out_manifest.parent.mkdir(parents=True, exist_ok=True)
