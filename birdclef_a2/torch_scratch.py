@@ -201,6 +201,7 @@ def train_torch_classifier(
     data_root: Path,
     label_col: str,
     relative_to: str,
+    val_relative_to: str | None = None,
     out_dir: Path,
     epochs: int,
     batch_size: int,
@@ -213,6 +214,7 @@ def train_torch_classifier(
     torch.manual_seed(seed)
     out_dir.mkdir(parents=True, exist_ok=True)
     arch_key = arch.strip().lower()
+    val_rel = val_relative_to if val_relative_to is not None else relative_to
 
     classes, label_to_idx = fit_label_mapping(train_manifest, val_manifest, label_col)
     n_classes = len(classes)
@@ -238,7 +240,7 @@ def train_torch_classifier(
         label_to_idx=label_to_idx,
         train_mode=False,
         seed=seed + 1,
-        relative_to=relative_to,
+        relative_to=val_rel,
     )
 
     dl_tr = DataLoader(
@@ -264,7 +266,8 @@ def train_torch_classifier(
     n_val = len(ds_va)
     steps_per_epoch = (n_train + batch_size - 1) // batch_size
     logger.info(
-        "%s: device=%s amp=%s train=%s val=%s classes=%s batch_size=%s steps/epoch≈%s",
+        "%s: device=%s amp=%s train=%s val=%s classes=%s batch_size=%s steps/epoch≈%s "
+        "train_paths=%s val_paths=%s",
         arch_key,
         device,
         amp_on,
@@ -273,6 +276,8 @@ def train_torch_classifier(
         n_classes,
         batch_size,
         steps_per_epoch,
+        relative_to,
+        val_rel,
     )
     if device.type == "cpu":
         logger.warning(

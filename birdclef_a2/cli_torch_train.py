@@ -21,6 +21,14 @@ def main() -> None:
         "--audio-relative-to",
         choices=("train_audio", "data_root"),
         default="train_audio",
+        help="How train manifest filename joins data-root (merged synth uses data_root).",
+    )
+    p.add_argument(
+        "--val-audio-relative-to",
+        choices=("train_audio", "data_root"),
+        default="train_audio",
+        help="How val manifest filename joins data-root. Default train_audio for "
+        "species/file.ogg rows even when train uses data_root.",
     )
     p.add_argument(
         "--arch",
@@ -48,6 +56,7 @@ def main() -> None:
         data_root=layout.root,
         label_col=args.label_col,
         relative_to=args.audio_relative_to,
+        val_relative_to=args.val_audio_relative_to,
         out_dir=args.out_dir,
         epochs=args.epochs,
         batch_size=args.batch_size,
