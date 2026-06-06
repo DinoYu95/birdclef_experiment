@@ -1,0 +1,16 @@
+{
+  "cli": "cli_torch_train",
+  "data_root": "/workspace/data",
+  "train_manifest": "outputs/splits/train.manifest.csv",
+  "val_manifest": "outputs/splits/val.manifest.csv",
+  "label_col": "primary_label",
+  "audio_relative_to": "train_audio",
+  "arch": "resnet18",
+  "epochs": 40,
+  "batch_size": 128,
+  "lr": 0.0003,
+  "seed": 42,
+  "num_workers": 8,
+  "no_amp": false,
+  "out_dir": "outputs/A_resnet18_scratch"
+}
